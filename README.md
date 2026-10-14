@@ -23,10 +23,10 @@ The X3 compiles but has not been run on hardware yet; reports welcome via issues
 
 ```yaml
 packages:
-  board: github://vjFaLk/esphome-xteink/packages/x4.yaml   # or x3.yaml / x4_pro.yaml
+  board: github://morpheby/esphome-xteink/packages/x4.yaml   # or x3.yaml / x4_pro.yaml
 
 external_components:
-  - source: github://vjFaLk/esphome-xteink
+  - source: github://morpheby/esphome-xteink
     components: [xteink]
 
 # the package already sets `xteink: {model: x4}`; override update_interval here if you want
@@ -43,9 +43,11 @@ font:
 display:
   - platform: xteink
     update_interval: never
+    refresh_mode: fast       # full | half (default) | fast
+    full_refresh_every: 20   # 0 disables periodic cleanup
+    # grayscale: true        # X4 Pro only; runtime fallback if unsupported
     lambda: |-
       it.print(20, 20, id(roboto_32), "Hello");
-      it.set_refresh_mode(2);   # 0 = full, 1 = half (default), 2 = fast (diff)
 
 binary_sensor:
   - platform: xteink
@@ -87,9 +89,15 @@ the stock bootloader and partition table, as with any ESP32 board.
 
 ### Display notes
 
-- The lambda repaints the whole frame every `update()`; the buffer is cleared afterwards.
+- Lambda/pages rendering clears before drawing by default. LVGL has no writer and keeps a
+  persistent framebuffer, so its dirty rectangles cannot erase untouched content.
+- Literal RGB blocks (including LVGL) are converted by luminance with the correct black/white
+  polarity. Native display lambdas keep ESPHome's `COLOR_ON` = black-pixel convention.
 - `it.set_refresh_mode(n)` picks the waveform for *this* refresh. The first refresh after boot is
   always at least a half refresh; later ones can be fast (partial/diff) updates.
+- `refresh_mode` avoids a boot lambda just to select the waveform, while `full_refresh_every`
+  provides periodic cleanup. `grayscale: true` requests four-level output on X4 Pro controllers
+  where FreeInk advertises absolute grayscale; unsupported variants log and render monochrome.
 - `it.update_count` counts refreshes, handy for "full refresh every N updates".
 - `deep_sleep` needs nothing extra in your YAML: on power-down the hub parks the panel (DSLP),
   drives the X4's GPIO13 battery latch LOW (a real power-off on battery, like CrossPoint;

@@ -1,6 +1,6 @@
 # Xteink X4: ESP32-C3, 16 MB flash.
 #   packages:
-#     board: github://vjFaLk/esphome-xteink/packages/x4.yaml
+#     board: github://morpheby/esphome-xteink/packages/x4.yaml
 esp32:
   variant: esp32c3
   flash_size: 16MB

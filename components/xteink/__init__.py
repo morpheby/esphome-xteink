@@ -160,10 +160,19 @@ def _vendor_sdk() -> Path:
 
 async def to_code(config):
     cg.add_build_flag(f"-D{MODELS[config[CONF_MODEL]][1]}=1")
+    if config[CONF_MODEL] == "x4_pro":
+        # Keep the 48 KB FreeInk framebuffer out of scarce internal DMA-capable
+        # RAM. allocFrameBufferStorage() still falls back to internal RAM if
+        # PSRAM initialization is unavailable.
+        cg.add_build_flag("-DFREEINK_FB_PSRAM=1")
     if config[CONF_HOLD_BATTERY_LATCH]:
         cg.add_build_flag("-DXTEINK_HOLD_BATTERY_LATCH=1")
-    # One 48 KB framebuffer; the panel controller's RAM holds the previous frame.
-    cg.add_build_flag("-DEINK_DISPLAY_SINGLE_BUFFER_MODE=1")
+    if config[CONF_MODEL] != "x4_pro":
+        # The C3 boards need the smaller allocation and their controllers retain
+        # the differential baseline. X4 Pro keeps both 48 KB buffers in PSRAM so
+        # partial LVGL writes and future continuous-tone rendering always have a
+        # host-side previous frame.
+        cg.add_build_flag("-DEINK_DISPLAY_SINGLE_BUFFER_MODE=1")
 
     # file:///abs/path is understood by PlatformIO (ESPHome <= 2026.7, copied into
     # .piolibdeps) and by ESPHome >= 2026.8's own library-to-IDF-component converter.

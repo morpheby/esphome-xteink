@@ -1,0 +1,38 @@
+esphome:
+  name: xteink-x4-pro-lvgl
+
+packages:
+  board: !include ../packages/x4_pro.yaml
+
+external_components:
+  - source:
+      type: local
+      path: ../components
+
+wifi:
+  ssid: example
+  password: example-password
+
+api:
+
+display:
+  - platform: xteink
+    id: epd
+    update_interval: never
+    refresh_mode: fast
+    full_refresh_every: 20
+    grayscale: true
+
+lvgl:
+  displays: epd
+  rotation: 90
+  refresh_interval: 250ms
+  update_when_display_idle: true
+  full_refresh: false
+  bg_color: 0xFFFFFF
+  text_color: 0x000000
+  widgets:
+    - label:
+        align: CENTER
+        text: "X4 Pro LVGL"
+        text_font: montserrat_24
