@@ -17,10 +17,18 @@ class XteinkDisplay : public display::DisplayBuffer {
   void set_parent(Xteink *parent) { this->parent_ = parent; }
   void set_writer(xteink_writer_t &&writer) { this->writer_local_ = writer; }
   void set_refresh_mode(int mode) { this->refresh_mode_ = static_cast<RefreshMode>(mode); }
-  display::DisplayType get_display_type() override { return display::DisplayType::DISPLAY_TYPE_BINARY; }
+  void set_full_refresh_every(uint32_t interval) { this->full_refresh_every_ = interval; }
+  void set_grayscale(bool enabled) { this->grayscale_enabled_ = enabled; }
+  display::DisplayType get_display_type() override {
+    return this->grayscale_enabled_ ? display::DisplayType::DISPLAY_TYPE_GRAYSCALE
+                                    : display::DisplayType::DISPLAY_TYPE_BINARY;
+  }
   int get_width_internal() override { return this->parent_->display().getDisplayWidth(); }
   int get_height_internal() override { return this->parent_->display().getDisplayHeight(); }
+  void setup() override;
   void draw_absolute_pixel_internal(int x, int y, Color color) override;
+  void draw_pixels_at(int x_start, int y_start, int w, int h, const uint8_t *ptr, display::ColorOrder order,
+                      display::ColorBitness bitness, bool big_endian, int x_offset, int y_offset, int x_pad) override;
   void update() override;
   void dump_config() override;
   float get_setup_priority() const override { return setup_priority::HARDWARE; }
@@ -32,6 +40,19 @@ class XteinkDisplay : public display::DisplayBuffer {
   optional<xteink_writer_t> writer_local_{};
   RefreshMode refresh_mode_{HALF_REFRESH};
   bool has_drawn_{false};
+  bool rgb_input_{false};
+  bool buffer_dirty_{false};
+  bool grayscale_enabled_{false};
+  bool grayscale_available_{false};
+  bool grayscale_warning_logged_{false};
+  uint32_t full_refresh_every_{0};
+  uint8_t *gray_luma_{nullptr};
+  uint8_t *gray_lsb_{nullptr};
+  uint8_t *gray_msb_{nullptr};
+  size_t gray_buffer_size_{0};
+  size_t gray_luma_size_{0};
+
+  void render_grayscale_planes_();
 };
 
 }  // namespace xteink

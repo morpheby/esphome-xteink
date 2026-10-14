@@ -10,7 +10,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        example: [x4, x3, x4_pro]
+        example: [x4, x3, x4_pro, x4_pro_lvgl]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
