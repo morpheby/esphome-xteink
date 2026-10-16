@@ -152,6 +152,86 @@ void XteinkDisplay::clear_grayscale_dirty_() {
   this->grayscale_dirty_full_ = false;
 }
 
+bool XteinkDisplay::is_grayscale_neighbor_(int x, int y) const {
+  auto &epd = this->parent_->display();
+  const int width = epd.getDisplayWidth();
+  const size_t luma_idx = static_cast<size_t>(y) * width + x;
+  const uint8_t level = static_cast<uint8_t>((this->gray_luma_[luma_idx] * 3U + 127U) / 255U);
+  if (level == 1 || level == 2)
+    return true;
+
+  // The changed pixel may have erased part of a gray object. The native-gray
+  // planes still describe the last settled frame until render_grayscale_overlay_()
+  // runs, so include intermediate pixels from either the old or new frame.
+  const size_t plane_idx = static_cast<size_t>(y) * epd.getDisplayWidthBytes() + (x >> 3);
+  const uint8_t bit = static_cast<uint8_t>(0x80 >> (x & 7));
+  return ((this->gray_lsb_[plane_idx] | this->gray_msb_[plane_idx]) & bit) != 0;
+}
+
+void XteinkDisplay::expand_grayscale_dirty_to_neighbors_() {
+  if (!this->grayscale_dirty_valid_ || this->grayscale_dirty_full_)
+    return;
+
+  auto &epd = this->parent_->display();
+  const int max_x = epd.getDisplayWidth() - 1;
+  const int max_y = epd.getDisplayHeight() - 1;
+  int x0 = this->grayscale_dirty_x0_;
+  int y0 = this->grayscale_dirty_y0_;
+  int x1 = this->grayscale_dirty_x1_;
+  int y1 = this->grayscale_dirty_y1_;
+
+  // Grow the rectangle one row/column at a time while its perimeter touches
+  // intermediate-gray pixels. This follows connected antialiasing, arcs, and
+  // fills to their object boundary without forcing an unrelated full-screen
+  // settle. Including the one-pixel corners makes diagonal AA connectivity
+  // count as neighboring too.
+  bool expanded;
+  do {
+    expanded = false;
+    if (x0 > 0) {
+      for (int y = std::max(0, y0 - 1); y <= std::min(max_y, y1 + 1); y++) {
+        if (this->is_grayscale_neighbor_(x0 - 1, y)) {
+          x0--;
+          expanded = true;
+          break;
+        }
+      }
+    }
+    if (x1 < max_x) {
+      for (int y = std::max(0, y0 - 1); y <= std::min(max_y, y1 + 1); y++) {
+        if (this->is_grayscale_neighbor_(x1 + 1, y)) {
+          x1++;
+          expanded = true;
+          break;
+        }
+      }
+    }
+    if (y0 > 0) {
+      for (int x = std::max(0, x0 - 1); x <= std::min(max_x, x1 + 1); x++) {
+        if (this->is_grayscale_neighbor_(x, y0 - 1)) {
+          y0--;
+          expanded = true;
+          break;
+        }
+      }
+    }
+    if (y1 < max_y) {
+      for (int x = std::max(0, x0 - 1); x <= std::min(max_x, x1 + 1); x++) {
+        if (this->is_grayscale_neighbor_(x, y1 + 1)) {
+          y1++;
+          expanded = true;
+          break;
+        }
+      }
+    }
+  } while (expanded);
+
+  this->grayscale_dirty_x0_ = x0;
+  this->grayscale_dirty_y0_ = y0;
+  this->grayscale_dirty_x1_ = x1;
+  this->grayscale_dirty_y1_ = y1;
+}
+
 void XteinkDisplay::render_grayscale_planes_() {
   auto &epd = this->parent_->display();
   memset(this->gray_lsb_, 0, this->gray_buffer_size_);
@@ -320,6 +400,7 @@ bool XteinkDisplay::settle_grayscale() {
   auto &epd = this->parent_->display();
   const bool zoned = this->grayscale_has_settled_ && !this->grayscale_dirty_full_;
   if (zoned) {
+    this->expand_grayscale_dirty_to_neighbors_();
     constexpr int MARGIN = 4;
     const int x0 = std::max(0, this->grayscale_dirty_x0_ - MARGIN);
     const int y0 = std::max(0, this->grayscale_dirty_y0_ - MARGIN);
@@ -364,6 +445,23 @@ bool XteinkDisplay::settle_grayscale() {
   this->update_count++;
   this->partial_refresh_count_ = 0;
   return true;
+}
+
+bool XteinkDisplay::flush_for_deep_sleep() {
+  // LVGL can finish drawing into the host framebuffer shortly before a sleep
+  // script runs. settle_grayscale() only refines a frame which has already
+  // reached the panel, so first submit any dirty B/W preview and synchronously
+  // finish its waveform. This makes the sleep boundary a real display flush.
+  this->finish_pending_refresh_(true);
+  if (this->buffer_dirty_) {
+    this->update();
+    this->finish_pending_refresh_(true);
+  }
+
+  if (this->grayscale_strategy_ == GRAYSCALE_ADAPTIVE && this->grayscale_available_ &&
+      this->grayscale_dirty_valid_)
+    return this->settle_grayscale();
+  return this->has_drawn_;
 }
 
 void XteinkDisplay::finalize_refresh_(EInkDisplay::RefreshMode mode) {
@@ -455,8 +553,15 @@ void XteinkDisplay::update() {
   this->cancel_timeout("grayscale_interactive_preview");
 
   EInkDisplay::RefreshMode mode = EInkDisplay::FULL_REFRESH;
-  if (this->refresh_mode_ == HALF_REFRESH || (this->refresh_mode_ == FAST_REFRESH && !this->has_drawn_)) {
-    mode = EInkDisplay::HALF_REFRESH;  // the very first frame cannot be a fast (diff) refresh
+  if (this->refresh_mode_ == HALF_REFRESH) {
+    mode = EInkDisplay::HALF_REFRESH;
+  } else if (this->refresh_mode_ == FAST_REFRESH && !this->has_drawn_) {
+    // After MCU sleep neither the retained panel contents nor the controller's
+    // old-image RAM can be assumed to match our newly allocated framebuffer.
+    // Adaptive gray makes that mismatch especially visible as uneven charge,
+    // so establish one strong known base before the first native-gray settle.
+    mode = this->grayscale_strategy_ == GRAYSCALE_ADAPTIVE ? EInkDisplay::FULL_REFRESH
+                                                           : EInkDisplay::HALF_REFRESH;
   } else if (this->refresh_mode_ == FAST_REFRESH) {
     mode = EInkDisplay::FAST_REFRESH;
   }

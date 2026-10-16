@@ -27,6 +27,7 @@ class XteinkDisplay : public display::DisplayBuffer {
   void postpone_grayscale_settle();
   void prepare_page_change();
   bool settle_grayscale();
+  bool flush_for_deep_sleep();
   display::DisplayType get_display_type() override {
     return this->grayscale_enabled_ ? display::DisplayType::DISPLAY_TYPE_GRAYSCALE
                                     : display::DisplayType::DISPLAY_TYPE_BINARY;
@@ -83,6 +84,8 @@ class XteinkDisplay : public display::DisplayBuffer {
   void mark_grayscale_dirty_(int x, int y);
   void mark_grayscale_full_();
   void clear_grayscale_dirty_();
+  void expand_grayscale_dirty_to_neighbors_();
+  bool is_grayscale_neighbor_(int x, int y) const;
   bool uses_native_grayscale_planes_() const { return this->grayscale_strategy_ != GRAYSCALE_DITHER; }
   void schedule_grayscale_settle_();
   void finalize_refresh_(EInkDisplay::RefreshMode mode);
