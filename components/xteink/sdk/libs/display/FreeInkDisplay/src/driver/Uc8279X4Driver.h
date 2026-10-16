@@ -102,6 +102,8 @@ class Uc8279X4Driver : public PanelDriver {
   void copyGrayscaleMsb(EpdBus& bus, const uint8_t* msb) override;
   void displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, const unsigned char* lut, bool factoryMode) override;
   void cleanupGrayscaleBuffers(EpdBus& bus, const uint8_t* bw) override;
+  void preserveGrayscaleOnFastRefresh() override { _redriveAfterGray = false; }
+  void setGrayscaleWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h) override;
   // Base frame for a grayscale overlay. The periodic clean the reader asks for
   // via a Half fallback must be a TRUE Full GC on this path — the Half is a B/W
   // invert-seed scrub that cannot clear the panel's gray edge charge and leaves
@@ -129,6 +131,7 @@ class Uc8279X4Driver : public PanelDriver {
   // GC flash. Ported from the UC8179 sibling; the base is restored to DTM1 after.
   void transitionGrayscaleBase(EpdBus& bus, const uint8_t* fb, bool turnOff);
   void runGrayscalePrecondition(EpdBus& bus);
+  void enterGrayscaleWindow(EpdBus& bus);
 
   const Uc8279X4Config& _cfg;
 
@@ -162,6 +165,11 @@ class Uc8279X4Driver : public PanelDriver {
   // by the next B/W displayStart to RE-DRIVE every pixel to its target (DTM1 =
   // ~newframe), scrubbing the residue with a cheap DU (no GC flash).
   bool _redriveAfterGray = false;
+  bool _grayscaleWindowEnabled = false;
+  uint16_t _grayscaleWindowX = 0;
+  uint16_t _grayscaleWindowY = 0;
+  uint16_t _grayscaleWindowW = 0;
+  uint16_t _grayscaleWindowH = 0;
   // Async split state (see Uc8179Driver for the contract).
   bool _pendingRefresh = false;
   bool _pendingTurnOff = false;
