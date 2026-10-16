@@ -826,6 +826,10 @@ void FreeInkDisplay::displayGrayBuffer(bool turnOffScreen, const unsigned char* 
   _driver->displayGray(_bus, frameBuffer, turnOffScreen, lut, factoryMode);
 }
 
+void FreeInkDisplay::setGrayscaleWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
+  if (_driver) _driver->setGrayscaleWindow(x, y, w, h);
+}
+
 void FreeInkDisplay::displayGrayCalibration(uint16_t customX, uint16_t customY, uint16_t customW, uint16_t customH) {
   cancelGrayscalePass();
   if (_inverted) return;
@@ -957,6 +961,10 @@ void FreeInkDisplay::cleanupGrayscaleBuffers(const uint8_t* bwBuffer) {
   // Restore frameBuffer so subsequent BW draws paint onto a valid BW baseline
   // rather than the stale LSB/MSB grayscale plane data that was there before.
   if (frameBuffer && bwBuffer && frameBuffer != bwBuffer) memcpy(frameBuffer, bwBuffer, bufferSize);
+}
+
+void FreeInkDisplay::preserveGrayscaleOnFastRefresh() {
+  if (_driver) _driver->preserveGrayscaleOnFastRefresh();
 }
 #ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
 void FreeInkDisplay::cleanupGrayscaleWithPreviousBuffer() {

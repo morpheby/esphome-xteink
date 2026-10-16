@@ -149,6 +149,13 @@ class FreeInkDisplay {
   // grayscale. Available in both buffer modes (CrossPoint's dual-buffer HAL
   // wraps it directly).
   void cleanupGrayscaleBuffers(const uint8_t* bwBuffer);
+  // Keep a native-gray frame visible across the next fast B/W update: only
+  // pixels whose binary target changed are driven. The default reader behavior
+  // still performs its controller-specific whole-frame post-gray cleanup.
+  void preserveGrayscaleOnFastRefresh();
+  // Limit the next grayscale settle to a visible-panel rectangle. Passing a
+  // zero width or height disables the window and selects the full panel.
+  void setGrayscaleWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h);
 #ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
   // Restore controller RAM and frameBuffer to the BW baseline after grayscale.
   // Uses frameBufferActive as the source (falls back to frameBuffer when the
@@ -308,6 +315,16 @@ class FreeInkDisplay {
 
   // Access to frame buffer
   uint8_t* getFrameBuffer() const { return frameBuffer; }
+  // Last frame submitted to the panel, used by renderers to compare their
+  // final output rather than an in-progress write buffer. Null in builds that
+  // intentionally use only one framebuffer.
+  const uint8_t* getActiveFrameBuffer() const {
+#ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
+    return frameBufferActive;
+#else
+    return nullptr;
+#endif
+  }
   bool framebufferReady() const { return frameBuffer != nullptr; }
 
   // Copy the just-displayed frame (frameBufferActive) back into the write buffer.
