@@ -190,6 +190,18 @@ class PanelDriver {
     (void)bus;
     (void)bw;
   }
+  // Some continuously-updating UIs intentionally keep the physical native-gray
+  // image as the visual baseline and apply the next B/W differential only to
+  // changed pixels. Readers keep the default post-gray whole-frame re-drive.
+  virtual void preserveGrayscaleOnFastRefresh() {}
+  // Restrict the next grayscale base/precondition and AA activation to a
+  // visible-panel rectangle. A zero-sized rectangle restores full-panel mode.
+  virtual void setGrayscaleWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
+    (void)x;
+    (void)y;
+    (void)w;
+    (void)h;
+  }
 
   // --- optional, controller-specific hooks (no-op by default) ---
   virtual void requestResync(uint8_t settlePasses) { (void)settlePasses; }

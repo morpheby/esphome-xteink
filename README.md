@@ -45,7 +45,9 @@ display:
     update_interval: never
     refresh_mode: fast       # full | half (default) | fast
     full_refresh_every: 20   # 0 disables periodic cleanup
-    # grayscale: true        # X4 Pro only; runtime fallback if unsupported
+    # grayscale: true        # X4 Pro only; accepts continuous luminance
+    # grayscale_strategy: adaptive  # native (default) | dither | adaptive
+    # grayscale_settle_time: 5s     # adaptive: quiet time before native gray
     lambda: |-
       it.print(20, 20, id(roboto_32), "Hello");
 
@@ -96,8 +98,12 @@ the stock bootloader and partition table, as with any ESP32 board.
 - `it.set_refresh_mode(n)` picks the waveform for *this* refresh. The first refresh after boot is
   always at least a half refresh; later ones can be fast (partial/diff) updates.
 - `refresh_mode` avoids a boot lambda just to select the waveform, while `full_refresh_every`
-  provides periodic cleanup. `grayscale: true` requests four-level output on X4 Pro controllers
-  where FreeInk advertises absolute grayscale; unsupported variants log and render monochrome.
+  provides periodic cleanup. `grayscale: true` accepts continuous luminance on X4 Pro.
+  `grayscale_strategy: native` (the default) uses the accurate but slow panel waveform;
+  `grayscale_strategy: dither` converts luminance through a stable ordered pattern and keeps
+  the normal fast differential waveform. `adaptive` uses dither while interacting, then runs
+  one native-gray settle after `grayscale_settle_time` of quiet. Unsupported native-gray
+  variants log and render monochrome.
 - `it.update_count` counts refreshes, handy for "full refresh every N updates".
 - `deep_sleep` needs nothing extra in your YAML: on power-down the hub parks the panel (DSLP),
   drives the X4's GPIO13 battery latch LOW (a real power-off on battery, like CrossPoint;

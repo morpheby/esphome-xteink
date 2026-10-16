@@ -290,6 +290,7 @@ void Uc8279X4Driver::begin(EpdBus& bus) {
   _oldPlaneValid = false;
   _needFullClear = true;
   _redriveAfterGray = false;
+  _grayscaleWindowEnabled = false;
   bus.reset(50);
   initController(bus);
   // Framebuffer-sized scratch for the grayscale absolute-plane fold (SPIRAM;
@@ -532,6 +533,7 @@ void Uc8279X4Driver::requestResync(uint8_t settlePasses) {
   _grayImagePass = false;
   _absoluteInput = false;
   _directGrayPass = false;
+  _grayscaleWindowEnabled = false;
   (void)settlePasses;
   _needFullClear = true;
 }
@@ -543,6 +545,7 @@ void Uc8279X4Driver::deepSleep(EpdBus& bus) {
   _grayImagePass = false;
   _absoluteInput = false;
   _directGrayPass = false;
+  _grayscaleWindowEnabled = false;
   if (_isScreenOn) {
     bus.cmd(CMD_POWER_OFF);
     bus.waitBusy(" 8279x4 power-down");
@@ -570,6 +573,59 @@ GrayscaleCapabilities Uc8279X4Driver::grayscaleCapabilities(GrayscaleMode mode) 
             mode == GrayscaleMode::Direct ? GrayscaleBase::Combined : GrayscaleBase::Separate, false, false, false};
   if (mode != GrayscaleMode::Overlay) return {};
   return {GrayscaleEncoding::OverlayMasks, GrayscaleBase::Separate, false, false, false};
+}
+
+void Uc8279X4Driver::setGrayscaleWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
+  if (w == 0 || h == 0 || x >= _w || y >= _h) {
+    _grayscaleWindowEnabled = false;
+    return;
+  }
+  _grayscaleWindowX = x;
+  _grayscaleWindowY = y;
+  _grayscaleWindowW = w > _w - x ? static_cast<uint16_t>(_w - x) : w;
+  _grayscaleWindowH = h > _h - y ? static_cast<uint16_t>(_h - y) : h;
+  _grayscaleWindowEnabled = true;
+}
+
+void Uc8279X4Driver::enterGrayscaleWindow(EpdBus& bus) {
+  uint16_t x0 = 0;
+  uint16_t y0 = 0;
+  uint16_t x1 = static_cast<uint16_t>(_w - 1);
+  uint16_t y1 = static_cast<uint16_t>(_h - 1);
+  if (_grayscaleWindowEnabled) {
+    x0 = _grayscaleWindowX;
+    y0 = _grayscaleWindowY;
+    x1 = static_cast<uint16_t>(_grayscaleWindowX + _grayscaleWindowW - 1);
+    y1 = static_cast<uint16_t>(_grayscaleWindowY + _grayscaleWindowH - 1);
+  }
+  if (FREEINK_UC8279X4_XMIRROR) {
+    const uint16_t mirrored0 = static_cast<uint16_t>(_w - 1 - x1);
+    x1 = static_cast<uint16_t>(_w - 1 - x0);
+    x0 = mirrored0;
+  }
+  if (FREEINK_UC8279X4_ROWREV) {
+    const uint16_t reversed0 = static_cast<uint16_t>(_h - 1 - y1);
+    y1 = static_cast<uint16_t>(_h - 1 - y0);
+    y0 = reversed0;
+  }
+  x0 = static_cast<uint16_t>(x0 & ~0x07U);
+  x1 = static_cast<uint16_t>(x1 | 0x07U);
+  if (x1 >= _w)
+    x1 = static_cast<uint16_t>(_w - 1);
+  y0 = static_cast<uint16_t>(y0 + _cfg.gateOffset);
+  y1 = static_cast<uint16_t>(y1 + _cfg.gateOffset);
+
+  bus.cmd(CMD_PARTIAL_IN);
+  bus.cmd(CMD_PARTIAL_WINDOW);
+  bus.data(static_cast<uint8_t>(x0 >> 8));
+  bus.data(static_cast<uint8_t>(x0 & 0xFF));
+  bus.data(static_cast<uint8_t>(x1 >> 8));
+  bus.data(static_cast<uint8_t>(x1 & 0xFF));
+  bus.data(static_cast<uint8_t>(y0 >> 8));
+  bus.data(static_cast<uint8_t>(y0 & 0xFF));
+  bus.data(static_cast<uint8_t>(y1 >> 8));
+  bus.data(static_cast<uint8_t>(y1 & 0xFF));
+  bus.data(0x01);
 }
 
 void Uc8279X4Driver::beginGrayscale(EpdBus& bus, const uint8_t* fb, GrayscaleMode mode, RefreshMode fallback,
@@ -676,6 +732,10 @@ void Uc8279X4Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, c
 
   powerOnIfNeeded(bus, " 8279x4_gray_PON");
 
+  const bool windowed = _grayscaleWindowEnabled;
+  if (windowed)
+    enterGrayscaleWindow(bus);
+
   // The reference rewrites PSR once more between PON and DRF.
   bus.cmd(CMD_PANEL_SETTING);
   bus.data(_cfg.psr0);
@@ -683,6 +743,8 @@ void Uc8279X4Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, c
 
   bus.cmd(CMD_DISPLAY_REFRESH);
   bus.waitBusy((_directGrayPass ? " 8279x4_DIRECT_GRAY_DRF" : " 8279x4_gray"));
+  if (windowed)
+    bus.cmd(CMD_PARTIAL_OUT);
   // Vendor production behavior: the UC8279 AA path leaves analog power enabled
   // between page refreshes (the UC8179 sibling does the same — its gray_aa sends
   // no POF). Honor only an explicit turnOff.
@@ -717,6 +779,7 @@ void Uc8279X4Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, c
   _grayImagePass = false;
   _absoluteInput = false;
   _directGrayPass = false;
+  _grayscaleWindowEnabled = false;
 }
 
 void Uc8279X4Driver::displayGrayscaleBase(EpdBus& bus, const uint8_t* fb, RefreshMode fallback, bool turnOff) {
@@ -768,20 +831,7 @@ void Uc8279X4Driver::runGrayscalePrecondition(EpdBus& bus) {
   if (!_oldPlaneValid || !_grayRefreshedOnce) return;
   bus.waitBusy(" 8279x4_gray_pre_ready");
 
-  const uint16_t xEnd = static_cast<uint16_t>(_w - 1);
-  const uint16_t yStart = _cfg.gateOffset;
-  const uint16_t yEnd = static_cast<uint16_t>(_cfg.gateOffset + _h - 1);
-  bus.cmd(CMD_PARTIAL_IN);
-  bus.cmd(CMD_PARTIAL_WINDOW);
-  bus.data(0x00);
-  bus.data(0x00);
-  bus.data(static_cast<uint8_t>(xEnd >> 8));
-  bus.data(static_cast<uint8_t>(xEnd | 0x07));
-  bus.data(static_cast<uint8_t>(yStart >> 8));
-  bus.data(static_cast<uint8_t>(yStart & 0xFF));
-  bus.data(static_cast<uint8_t>(yEnd >> 8));
-  bus.data(static_cast<uint8_t>(yEnd & 0xFF));
-  bus.data(0x01);
+  enterGrayscaleWindow(bus);
 
   bus.cmd(CMD_PANEL_SETTING);
   bus.data(_cfg.psr0);  // REG=1: run the external settle tables
