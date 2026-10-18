@@ -406,11 +406,8 @@ bool XteinkDisplay::settle_grayscale() {
     const int y0 = std::max(0, this->grayscale_dirty_y0_ - MARGIN);
     const int x1 = std::min(epd.getDisplayWidth() - 1, this->grayscale_dirty_x1_ + MARGIN);
     const int y1 = std::min(epd.getDisplayHeight() - 1, this->grayscale_dirty_y1_ + MARGIN);
-    ESP_LOGD(TAG, "Settling ordered-dither preview to native grayscale in zone %d,%d %dx%d", x0, y0,
-             x1 - x0 + 1, y1 - y0 + 1);
     epd.setGrayscaleWindow(x0, y0, x1 - x0 + 1, y1 - y0 + 1);
   } else {
-    ESP_LOGD(TAG, "Settling ordered-dither preview to native grayscale over the full panel");
     epd.setGrayscaleWindow(0, 0, 0, 0);
   }
   // Adaptive UI settling follows CrossPoint's text/UI path. Its overlay mode
@@ -578,7 +575,6 @@ void XteinkDisplay::update() {
   bool ordinary_buffer_refresh = false;
   if (this->grayscale_available_ && this->grayscale_strategy_ != GRAYSCALE_NATIVE) {
     if (!this->render_ordered_dither_()) {
-      ESP_LOGV(TAG, "Skipping panel refresh: ordered-dither output is unchanged");
       this->buffer_dirty_ = false;
       // Native gray has four levels while the preview has only two. A luma
       // change can land on the same Bayer bit yet still require a gray update.
