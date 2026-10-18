@@ -22,6 +22,13 @@ static uint8_t lastRegister(const EpdBus& bus, uint8_t command) {
   return 0;
 }
 
+static const EpdBus::Write& lastWrite(const EpdBus& bus, uint8_t command) {
+  for (auto i = bus.writes.rbegin(); i != bus.writes.rend(); ++i)
+    if (i->command == command) return *i;
+  assert(false);
+  return bus.writes.front();
+}
+
 static Bytes frame(unsigned seed) {
   Bytes b(48000);
   for (size_t i=0; i<b.size(); ++i) b[i]=uint8_t((i*37 + i/100*11 + seed) ^ (i>>8));
@@ -505,6 +512,39 @@ static void testUc8279X4WaveformSelection() {
     assert(render(GrayscaleMode::Overlay, 0x01, false) != quality);
   }
   BoardConfig::ACTIVE.displayControllerVariant = 0x68;
+  driver._redriveAfterGray = true;
+  driver.preserveGrayscaleOnFastRefresh();
+  assert(!driver._redriveAfterGray);
+  free(driver._grayBase);
+}
+
+static void testUc8279X4GrayscaleWindow() {
+  Uc8279X4Driver driver;
+  EpdBus bus;
+  driver.begin(bus);
+  driver._grayRefreshedOnce = true;
+  driver._oldPlaneValid = true;
+  driver._needFullClear = false;
+  driver.setGrayscaleWindow(13, 17, 22, 31);
+
+  bus.clear();
+  driver.runGrayscalePrecondition(bus);
+  const Bytes expected = {0x00, 0x08, 0x00, 0x27, 0x00, 0x89, 0x00, 0xA7, 0x01};
+  assert(lastWrite(bus, 0x90).bytes == expected);
+  assert(std::count_if(bus.writes.begin(), bus.writes.end(),
+                       [](const auto& w) { return w.command == 0x91; }) == 1);
+  assert(std::count_if(bus.writes.begin(), bus.writes.end(),
+                       [](const auto& w) { return w.command == 0x92; }) == 1);
+
+  bus.clear();
+  const auto bw = frame(41);
+  driver.displayGray(bus, bw.data(), false, nullptr, false);
+  assert(lastWrite(bus, 0x90).bytes == expected);
+  assert(std::count_if(bus.writes.begin(), bus.writes.end(),
+                       [](const auto& w) { return w.command == 0x91; }) == 1);
+  assert(std::count_if(bus.writes.begin(), bus.writes.end(),
+                       [](const auto& w) { return w.command == 0x92; }) == 1);
+  assert(!driver._grayscaleWindowEnabled);
   free(driver._grayBase);
 }
 
@@ -541,6 +581,7 @@ int main(int argc, char**) {
   }
   testUc8179GrayShadeSplit();
   testUc8279X4WaveformSelection();
+  testUc8279X4GrayscaleWindow();
   testDirectSleep<Uc8179Driver>();
   testDirectSleep<Uc8279X4Driver>();
   testUltraChipAbsolute<Uc8179Driver>(true, 0, false);

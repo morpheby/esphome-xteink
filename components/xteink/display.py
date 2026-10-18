@@ -15,11 +15,19 @@ XteinkDisplayRef = XteinkDisplay.operator("ref")
 CONF_REFRESH_MODE = "refresh_mode"
 CONF_FULL_REFRESH_EVERY = "full_refresh_every"
 CONF_GRAYSCALE = "grayscale"
+CONF_GRAYSCALE_STRATEGY = "grayscale_strategy"
+CONF_GRAYSCALE_SETTLE_TIME = "grayscale_settle_time"
 
 REFRESH_MODES = {
     "full": 0,
     "half": 1,
     "fast": 2,
+}
+
+GRAYSCALE_STRATEGIES = {
+    "native": 0,
+    "dither": 1,
+    "adaptive": 2,
 }
 
 CONFIG_SCHEMA = display.FULL_DISPLAY_SCHEMA.extend(
@@ -31,6 +39,12 @@ CONFIG_SCHEMA = display.FULL_DISPLAY_SCHEMA.extend(
         ),
         cv.Optional(CONF_FULL_REFRESH_EVERY, default=0): cv.int_range(min=0),
         cv.Optional(CONF_GRAYSCALE, default=False): cv.boolean,
+        cv.Optional(CONF_GRAYSCALE_STRATEGY): cv.enum(
+            GRAYSCALE_STRATEGIES, lower=True
+        ),
+        cv.Optional(CONF_GRAYSCALE_SETTLE_TIME, default="5s"): (
+            cv.positive_time_period_milliseconds
+        ),
     }
 ).extend(cv.polling_component_schema("1s"))
 
@@ -40,6 +54,8 @@ def _final_validate(config):
         raise cv.Invalid(
             "grayscale currently requires the X4 Pro's PSRAM; use monochrome on X4/X3"
         )
+    if not config[CONF_GRAYSCALE] and CONF_GRAYSCALE_STRATEGY in config:
+        raise cv.Invalid("grayscale_strategy requires grayscale: true")
     return config
 
 
@@ -52,6 +68,16 @@ async def to_code(config):
     cg.add(var.set_refresh_mode(config[CONF_REFRESH_MODE]))
     cg.add(var.set_full_refresh_every(config[CONF_FULL_REFRESH_EVERY]))
     cg.add(var.set_grayscale(config[CONF_GRAYSCALE]))
+    cg.add(
+        var.set_grayscale_strategy(
+            config.get(CONF_GRAYSCALE_STRATEGY, GRAYSCALE_STRATEGIES["native"])
+        )
+    )
+    cg.add(
+        var.set_grayscale_settle_time(
+            config[CONF_GRAYSCALE_SETTLE_TIME].total_milliseconds
+        )
+    )
     if CONF_LAMBDA in config:
         lambda_ = await cg.process_lambda(
             config[CONF_LAMBDA], [(XteinkDisplayRef, "it")], return_type=cg.void

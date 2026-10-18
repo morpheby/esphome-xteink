@@ -23,4 +23,13 @@ for l in "${LIBS[@]}"; do
 done
 cp "$SRC/LICENSE" "$SRC/NOTICE" "$DST/"
 echo "$SHA" > "$DST/SDK_COMMIT"
+
+PATCH_DIR=$ROOT/components/xteink/sdk-patches
+if compgen -G "$PATCH_DIR/*.patch" >/dev/null; then
+  for patch in "$PATCH_DIR"/*.patch; do
+    git -C "$ROOT" apply --unidiff-zero --whitespace=nowarn \
+      --directory=components/xteink/sdk "$patch"
+  done
+fi
+
 echo "synced freeink-sdk@$SHA -> $DST"
