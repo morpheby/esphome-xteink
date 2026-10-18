@@ -4,9 +4,13 @@ ESPHome components for the **Xteink X4, X3 and X4 Pro** e-paper readers, built o
 [FreeInk SDK](https://github.com/Free-Ink/freeink-sdk) (the actively maintained successor of
 `open-x4-epaper/community-sdk`, and what [CrossPoint](https://github.com/crosspoint-reader/crosspoint-reader) runs on).
 
-The SDK is not copied into the ESPHome code: it is vendored *unmodified* under
-`components/xteink/sdk/`, pinned by commit, and built as ordinary PlatformIO libraries.
-Updating to a newer SDK is one script run (see [Bumping the SDK](#bumping-the-sdk)).
+This repository is a fork of [vjFaLk/esphome-xteink](https://github.com/vjFaLk/esphome-xteink)
+and keeps its component and configuration surface compatible with that upstream project.
+
+The SDK is not copied into the ESPHome code: it is vendored under
+`components/xteink/sdk/`, pinned by commit, then supplemented by the small tracked patches in
+`components/xteink/sdk-patches/`, and built as ordinary PlatformIO libraries. Updating to a
+newer SDK is one script run plus a patch rebase (see [Bumping the SDK](#bumping-the-sdk)).
 
 | Model  | MCU      | Panel                        | Display | Buttons | Battery | Frontlight | Touch |
 |--------|----------|------------------------------|---------|---------|---------|------------|-------|
@@ -18,6 +22,10 @@ All three compile in CI. **Hardware status:** tested on an **X4** (display, butt
 deep sleep/wake) and an **X4 Pro** (display, GT911 touch + home key, edge/power buttons,
 CW2017 battery, frontlight, OTA, deep sleep/wake), both driving a Home Assistant remote.
 The X3 compiles but has not been run on hardware yet; reports welcome via issues.
+
+The grayscale implementation in this version is currently hardware-tested only on an
+**X4 Pro with a UC8279 panel**. It supports four-level gray using native, ordered-dither,
+and adaptive rendering; no grayscale hardware validation is claimed for the X4 or X3.
 
 ## Usage
 
@@ -45,7 +53,9 @@ display:
     update_interval: never
     refresh_mode: fast       # full | half (default) | fast
     full_refresh_every: 20   # 0 disables periodic cleanup
-    # grayscale: true        # X4 Pro only; runtime fallback if unsupported
+    # grayscale: true        # X4 Pro only; accepts continuous luminance
+    # grayscale_strategy: adaptive  # native (default) | dither | adaptive
+    # grayscale_settle_time: 5s     # adaptive: quiet time before native gray
     lambda: |-
       it.print(20, 20, id(roboto_32), "Hello");
 
@@ -96,8 +106,12 @@ the stock bootloader and partition table, as with any ESP32 board.
 - `it.set_refresh_mode(n)` picks the waveform for *this* refresh. The first refresh after boot is
   always at least a half refresh; later ones can be fast (partial/diff) updates.
 - `refresh_mode` avoids a boot lambda just to select the waveform, while `full_refresh_every`
-  provides periodic cleanup. `grayscale: true` requests four-level output on X4 Pro controllers
-  where FreeInk advertises absolute grayscale; unsupported variants log and render monochrome.
+  provides periodic cleanup. `grayscale: true` accepts continuous luminance on X4 Pro.
+  `grayscale_strategy: native` (the default) uses the accurate but slow panel waveform;
+  `grayscale_strategy: dither` converts luminance through a stable ordered pattern and keeps
+  the normal fast differential waveform. `adaptive` uses dither while interacting, then runs
+  one native-gray settle after `grayscale_settle_time` of quiet. Unsupported native-gray
+  variants log and render monochrome.
 - `it.update_count` counts refreshes, handy for "full refresh every N updates".
 - `deep_sleep` needs nothing extra in your YAML: on power-down the hub parks the panel (DSLP),
   drives the X4's GPIO13 battery latch LOW (a real power-off on battery, like CrossPoint;
@@ -130,8 +144,8 @@ PlatformIO library at `<build>/lib/xteink-sdk` and declares it with
 `cg.add_library("xteink-sdk", None, "file:///…")`. That single-library shape is deliberate: the
 SDK libs `#include` each other, and neither PlatformIO with ESPHome's `lib_ldf_mode = off`
 (ESPHome ≤ 2026.7) nor ESPHome ≥ 2026.8's library-to-ESP-IDF-component converter links local
-libraries to each other. Nothing in `sdk/libs` is edited (CI fails if it is); the merge is
-redone whenever `sdk/` changes.
+libraries to each other. The sync script replays `sdk-patches/` after copying the pinned SDK;
+CI runs the same operation and fails if the checked-in result is not reproducible.
 
 Two ESPHome facts explain the rest of the shape: external components never clone git
 submodules, and only files directly inside the component folder are compiled — so a vendored
@@ -143,12 +157,15 @@ copy plus `add_library` is the only route that works for `github://` users witho
 scripts/sync-sdk.sh <freeink-sdk commit sha>
 ```
 
-re-copies the six libraries, refreshes `sdk/LICENSE` + `sdk/NOTICE` and writes `sdk/SDK_COMMIT`.
-Then compile the three examples (`cd examples && esphome compile x4.yaml` …) and open a PR.
-The `sdk-in-sync` CI job re-runs the script against `SDK_COMMIT` and fails on any drift.
+re-copies the six libraries, refreshes `sdk/LICENSE` + `sdk/NOTICE`, writes `sdk/SDK_COMMIT`,
+and reapplies every patch in `sdk-patches/`. Rebase those patches if the pinned SDK changed,
+then compile the examples (`cd examples && esphome compile x4.yaml` …) and open a PR. The
+`sdk-in-sync` CI job re-runs the complete sync-and-patch operation and fails on any drift.
 
 ## Credits
 
+- [vjFaLk/esphome-xteink](https://github.com/vjFaLk/esphome-xteink) — the upstream ESPHome
+  component this fork extends.
 - [FreeInk SDK](https://github.com/Free-Ink/freeink-sdk) — drivers, board profiles, waveforms.
 - [OpenX4 community-sdk](https://github.com/open-x4-epaper/community-sdk) and CidVonHighwind —
   the original SSD1677 driver and panel tuning FreeInk derives from.
