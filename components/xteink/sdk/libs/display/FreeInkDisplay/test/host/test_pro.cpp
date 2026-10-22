@@ -529,6 +529,16 @@ static void testUc8279X4GrayscaleWindow() {
   assert(driver._oldPlaneValid);
   assert(!driver._needFullClear);
   assert(!driver._redriveAfterGray);
+
+  bus.clear();
+  const auto retained = frame(39);
+  driver.seedPreviousFrame(bus, retained.data());
+  assert(std::count_if(bus.writes.begin(), bus.writes.end(),
+                       [](const auto& w) { return w.command == 0x10; }) == 1);
+  assert(std::count_if(bus.writes.begin(), bus.writes.end(),
+                       [](const auto& w) { return w.command == 0x13; }) == 0);
+  assert(std::count_if(bus.writes.begin(), bus.writes.end(),
+                       [](const auto& w) { return w.command == 0x12; }) == 0);
   driver.setGrayscaleWindow(13, 17, 22, 31);
 
   bus.clear();
