@@ -91,6 +91,9 @@ class XteinkDisplay : public display::DisplayBuffer {
   uint8_t *gray_luma_{nullptr};
   uint8_t *gray_lsb_{nullptr};
   uint8_t *gray_msb_{nullptr};
+  uint8_t *gray_flood_visited_{nullptr};
+  uint32_t *gray_flood_queue_{nullptr};
+  size_t gray_flood_queue_capacity_{0};
   size_t gray_buffer_size_{0};
   size_t gray_luma_size_{0};
 
