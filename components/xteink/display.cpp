@@ -16,6 +16,7 @@ static const char *const TAG = "xteink.display";
 struct RetainedFrameTag {
   uint32_t magic;
   uint32_t value;
+  uint32_t partial_refreshes;
   uint32_t check;
 };
 
@@ -27,7 +28,8 @@ static RTC_NOINIT_ATTR RetainedFrameTag retained_frame_tag;
 
 bool XteinkDisplay::has_retained_frame_tag() const {
   return retained_frame_tag.magic == RETAINED_FRAME_TAG_MAGIC &&
-         retained_frame_tag.check == (retained_frame_tag.value ^ RETAINED_FRAME_TAG_MAGIC);
+         retained_frame_tag.check ==
+             (retained_frame_tag.value ^ retained_frame_tag.partial_refreshes ^ RETAINED_FRAME_TAG_MAGIC);
 }
 
 uint32_t XteinkDisplay::get_retained_frame_tag() const {
@@ -36,13 +38,15 @@ uint32_t XteinkDisplay::get_retained_frame_tag() const {
 
 void XteinkDisplay::set_retained_frame_tag(uint32_t tag) {
   retained_frame_tag.value = tag;
-  retained_frame_tag.check = tag ^ RETAINED_FRAME_TAG_MAGIC;
+  retained_frame_tag.partial_refreshes = this->partial_refresh_count_;
+  retained_frame_tag.check = tag ^ retained_frame_tag.partial_refreshes ^ RETAINED_FRAME_TAG_MAGIC;
   retained_frame_tag.magic = RETAINED_FRAME_TAG_MAGIC;
 }
 
 void XteinkDisplay::clear_retained_frame_tag() {
   retained_frame_tag.magic = 0;
   retained_frame_tag.value = 0;
+  retained_frame_tag.partial_refreshes = 0;
   retained_frame_tag.check = 0;
 }
 
@@ -420,12 +424,13 @@ void XteinkDisplay::prepare_page_change() {
 }
 
 void XteinkDisplay::begin_retained_frame_bootstrap() {
-  // A deep-sleep application can deterministically rebuild the exact frame it
-  // left on the non-volatile panel. Let LVGL paint that frame into fresh host
-  // buffers, then adopt it as the differential baseline without touching the
-  // panel. The next real update can therefore remain a small fast diff.
+  // Let LVGL rebuild the exact retained frame into fresh host buffers while
+  // panel writes are suppressed. The following clock-only mutation can then be
+  // reduced to its normal dirty rectangle without redrawing unrelated pixels.
   this->retained_frame_adopted_ = false;
   this->retained_frame_bootstrap_pending_ = true;
+  if (this->has_retained_frame_tag())
+    this->partial_refresh_count_ = retained_frame_tag.partial_refreshes;
 }
 
 bool XteinkDisplay::settle_grayscale() {
@@ -441,7 +446,9 @@ bool XteinkDisplay::settle_grayscale() {
     return false;
 
   auto &epd = this->parent_->display();
-  const bool zoned = this->grayscale_has_settled_ && !this->grayscale_dirty_full_;
+  const bool periodic_full = this->full_refresh_every_ != 0 &&
+                             this->partial_refresh_count_ + 1 >= this->full_refresh_every_;
+  const bool zoned = this->grayscale_has_settled_ && !this->grayscale_dirty_full_ && !periodic_full;
   if (zoned) {
     this->expand_grayscale_dirty_to_neighbors_();
     constexpr int MARGIN = 4;
@@ -460,7 +467,8 @@ bool XteinkDisplay::settle_grayscale() {
   // Fast lets the controller move from the dither preview to the overlay's
   // solid B/W base with its differential preconditioning waveform; the gray
   // pass then drives only the intermediate-level masks.
-  if (!epd.displayGrayscaleBase(freeink::GrayscaleMode::Overlay, EInkDisplay::FAST_REFRESH)) {
+  const auto base_mode = periodic_full ? EInkDisplay::FULL_REFRESH : EInkDisplay::FAST_REFRESH;
+  if (!epd.displayGrayscaleBase(freeink::GrayscaleMode::Overlay, base_mode)) {
     ESP_LOGW(TAG, "Native grayscale settle became unavailable; keeping ordered-dither output");
     epd.setGrayscaleWindow(0, 0, 0, 0);
     return false;
@@ -483,7 +491,10 @@ bool XteinkDisplay::settle_grayscale() {
   this->grayscale_has_settled_ = true;
   this->clear_grayscale_dirty_();
   this->update_count++;
-  this->partial_refresh_count_ = 0;
+  if (periodic_full)
+    this->partial_refresh_count_ = 0;
+  else
+    this->partial_refresh_count_++;
   return true;
 }
 
@@ -578,37 +589,32 @@ void XteinkDisplay::update() {
   if (this->retained_frame_bootstrap_pending_) {
     this->retained_frame_bootstrap_pending_ = false;
 
-    // A settled adaptive frame consists of the solid B/W base plus native-gray
-    // overlay masks. Rebuild both and re-seed the panel controller's volatile
-    // RAM so the first zoned update does not fall back to a full B/W waveform
-    // and erase retained gray outside its update window.
-    bool controller_adopted = true;
+    // Reconstruct the exact B/W base and native-gray masks in RAM, then adopt
+    // them without sending pixels to the panel. Do not rewrite the controller
+    // planes here: the panel/controller already retain the prior frame, and
+    // replacing both planes with a guessed binary base destroys that reference.
     if (this->grayscale_available_ && this->grayscale_strategy_ == GRAYSCALE_ADAPTIVE) {
       this->render_grayscale_overlay_();
-      controller_adopted = epd.adoptRetainedGrayscaleFrame(epd.getFrameBuffer());
-      this->native_grayscale_on_panel_ = controller_adopted;
-      this->grayscale_has_settled_ = controller_adopted;
+      this->native_grayscale_on_panel_ = true;
+      this->grayscale_has_settled_ = true;
+      epd.preserveGrayscaleOnFastRefresh();
     }
-    if (!controller_adopted) {
-      this->mark_grayscale_full_();
-      this->force_full_refresh_ = true;
-    } else {
+    epd.skipInitialResync();
 #ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
-      epd.swapBuffers();
+    epd.swapBuffers();
 #endif
-      epd.syncWriteBufferFromActive();
-      this->has_drawn_ = true;
-      this->buffer_dirty_ = false;
-      this->force_full_refresh_ = false;
-      this->interactive_preview_requested_ = false;
-      this->cancel_timeout("grayscale_interactive_preview");
-      this->cancel_timeout("grayscale_settle");
-      this->grayscale_settle_pending_ = false;
-      this->clear_grayscale_dirty_();
-      this->retained_frame_adopted_ = true;
-      ESP_LOGD(TAG, "Adopted reconstructed retained frame without refreshing the panel");
-      return;
-    }
+    epd.syncWriteBufferFromActive();
+    this->has_drawn_ = true;
+    this->buffer_dirty_ = false;
+    this->force_full_refresh_ = false;
+    this->interactive_preview_requested_ = false;
+    this->cancel_timeout("grayscale_interactive_preview");
+    this->cancel_timeout("grayscale_settle");
+    this->grayscale_settle_pending_ = false;
+    this->clear_grayscale_dirty_();
+    this->retained_frame_adopted_ = true;
+    ESP_LOGD(TAG, "Reconstructed retained frame in RAM without refreshing the panel");
+    return;
   }
 
   if (this->grayscale_available_ && this->grayscale_strategy_ == GRAYSCALE_ADAPTIVE &&

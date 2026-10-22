@@ -538,21 +538,12 @@ void Uc8279X4Driver::requestResync(uint8_t settlePasses) {
   _needFullClear = true;
 }
 
-void Uc8279X4Driver::skipInitialResync() { _needFullClear = false; }
-
-bool Uc8279X4Driver::adoptRetainedGrayscaleFrame(EpdBus& bus, const uint8_t* bw) {
-  if (!bw) return false;
-
-  // Deep sleep resets both the driver object and the controller RAM, but the
-  // electrophoretic gray image remains visible. Recreate the clean B/W base in
-  // both controller planes without firing DRF; the next windowed AA transition
-  // can then compare against a truthful baseline and leave all gray pixels
-  // outside that window physically untouched.
-  bus.waitBusy(" 8279x4_retained_ready");
-  streamPlane(bus, CMD_DTM1, bw);
-  streamPlane(bus, CMD_DTM2, bw);
-  _oldPlaneValid = true;
+void Uc8279X4Driver::skipInitialResync() {
+  // The caller has reconstructed the exact retained frame in its host buffers.
+  // Adopt the controller state logically only; do not stream either plane or
+  // trigger a waveform, because doing so destroys the retained gray reference.
   _needFullClear = false;
+  _oldPlaneValid = true;
   _grayRefreshedOnce = true;
   _redriveAfterGray = false;
   _grayBaseValid = false;
@@ -561,7 +552,6 @@ bool Uc8279X4Driver::adoptRetainedGrayscaleFrame(EpdBus& bus, const uint8_t* bw)
   _directGrayPass = false;
   _directGrayOnPanel = false;
   _grayscaleWindowEnabled = false;
-  return true;
 }
 
 void Uc8279X4Driver::deepSleep(EpdBus& bus) {

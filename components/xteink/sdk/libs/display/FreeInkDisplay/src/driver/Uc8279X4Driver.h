@@ -103,7 +103,6 @@ class Uc8279X4Driver : public PanelDriver {
   void displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, const unsigned char* lut, bool factoryMode) override;
   void cleanupGrayscaleBuffers(EpdBus& bus, const uint8_t* bw) override;
   void preserveGrayscaleOnFastRefresh() override { _redriveAfterGray = false; }
-  bool adoptRetainedGrayscaleFrame(EpdBus& bus, const uint8_t* bw) override;
   void setGrayscaleWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h) override;
   // Base frame for a grayscale overlay. The periodic clean the reader asks for
   // via a Half fallback must be a TRUE Full GC on this path — the Half is a B/W

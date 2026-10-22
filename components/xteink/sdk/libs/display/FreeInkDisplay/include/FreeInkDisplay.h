@@ -153,9 +153,6 @@ class FreeInkDisplay {
   // pixels whose binary target changed are driven. The default reader behavior
   // still performs its controller-specific whole-frame post-gray cleanup.
   void preserveGrayscaleOnFastRefresh();
-  // Re-seed controller RAM from the clean B/W base of a native-gray image that
-  // survived MCU deep sleep, without visibly refreshing the panel.
-  bool adoptRetainedGrayscaleFrame(const uint8_t* bwBuffer = nullptr);
   // Limit the next grayscale settle to a visible-panel rectangle. Passing a
   // zero width or height disables the window and selects the full panel.
   void setGrayscaleWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h);
