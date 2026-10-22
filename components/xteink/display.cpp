@@ -1,4 +1,3 @@
-/Users/morpheby/.rvm/scripts/rvm:29: operation not permitted: ps
 #include "display.h"
 
 #include "esphome/core/log.h"
@@ -664,6 +663,10 @@ void XteinkDisplay::update() {
     epd.swapBuffers();
 #endif
     epd.syncWriteBufferFromActive();
+    // The panel image survives deep sleep, but the UC8279's differential OLD
+    // plane cannot be trusted. Seed only that invisible reference from the
+    // reconstructed B/W base; do not write the NEW plane or trigger a waveform.
+    epd.syncRedRamFromFrameBuffer();
     this->has_drawn_ = true;
     this->buffer_dirty_ = false;
     this->force_full_refresh_ = false;
