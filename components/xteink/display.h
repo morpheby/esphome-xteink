@@ -1,4 +1,3 @@
-/Users/morpheby/.rvm/scripts/rvm:29: operation not permitted: ps
 #pragma once
 
 #include "esphome/components/display/display_buffer.h"
