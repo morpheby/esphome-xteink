@@ -194,6 +194,15 @@ class PanelDriver {
   // image as the visual baseline and apply the next B/W differential only to
   // changed pixels. Readers keep the default post-gray whole-frame re-drive.
   virtual void preserveGrayscaleOnFastRefresh() {}
+  // Rebuild controller RAM for a native-gray frame which remained visible
+  // while the MCU was in deep sleep. Implementations must not trigger a panel
+  // waveform: `bw` is the clean B/W base beneath the retained gray overlay.
+  // Returning false makes the caller fall back to a normal physical refresh.
+  virtual bool adoptRetainedGrayscaleFrame(EpdBus& bus, const uint8_t* bw) {
+    (void)bus;
+    (void)bw;
+    return false;
+  }
   // Restrict the next grayscale base/precondition and AA activation to a
   // visible-panel rectangle. A zero-sized rectangle restores full-panel mode.
   virtual void setGrayscaleWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {

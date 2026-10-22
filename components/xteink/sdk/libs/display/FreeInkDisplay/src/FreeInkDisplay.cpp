@@ -966,6 +966,16 @@ void FreeInkDisplay::cleanupGrayscaleBuffers(const uint8_t* bwBuffer) {
 void FreeInkDisplay::preserveGrayscaleOnFastRefresh() {
   if (_driver) _driver->preserveGrayscaleOnFastRefresh();
 }
+
+bool FreeInkDisplay::adoptRetainedGrayscaleFrame(const uint8_t* bwBuffer) {
+  cancelGrayscalePass();
+  syncPendingAsync();
+  const uint8_t* baseline = bwBuffer ? bwBuffer : frameBuffer;
+  if (!_driver || !baseline || _inverted) return false;
+  _shadowValid = false;
+  _redRamSynced = false;
+  return _driver->adoptRetainedGrayscaleFrame(_bus, baseline);
+}
 #ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
 void FreeInkDisplay::cleanupGrayscaleWithPreviousBuffer() {
   cancelGrayscalePass();

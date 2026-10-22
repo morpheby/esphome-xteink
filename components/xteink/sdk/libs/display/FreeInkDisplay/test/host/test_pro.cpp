@@ -548,6 +548,31 @@ static void testUc8279X4GrayscaleWindow() {
   free(driver._grayBase);
 }
 
+static void testUc8279X4RetainedGrayscaleFrame() {
+  Uc8279X4Driver driver;
+  EpdBus bus;
+  driver.begin(bus);
+  const auto bw = frame(53);
+
+  bus.clear();
+  assert(driver.adoptRetainedGrayscaleFrame(bus, bw.data()));
+  assert(lastWrite(bus, 0x10).bytes.size() == 60000);
+  assert(lastWrite(bus, 0x13).bytes.size() == 60000);
+  assert(driver._oldPlaneValid);
+  assert(!driver._needFullClear);
+  assert(driver._grayRefreshedOnce);
+  assert(!driver._redriveAfterGray);
+
+  driver.setGrayscaleWindow(700, 10, 80, 35);
+  bus.clear();
+  driver.beginGrayscale(bus, bw.data(), GrayscaleMode::Overlay, RefreshMode::Fast, false);
+  assert(std::count_if(bus.writes.begin(), bus.writes.end(),
+                       [](const auto& w) { return w.command == 0x12; }) == 1);
+  const Bytes expected = {0x02, 0xB8, 0x03, 0x0F, 0x00, 0x82, 0x00, 0xA4, 0x01};
+  assert(lastWrite(bus, 0x90).bytes == expected);
+  free(driver._grayBase);
+}
+
 static void testStickyAbsolute() {
   BoardConfig::ACTIVE.board = BoardConfig::Board::Sticky;
   auto& driver = static_cast<Ssd1677Driver&>(ssd1677Driver());
@@ -582,6 +607,7 @@ int main(int argc, char**) {
   testUc8179GrayShadeSplit();
   testUc8279X4WaveformSelection();
   testUc8279X4GrayscaleWindow();
+  testUc8279X4RetainedGrayscaleFrame();
   testDirectSleep<Uc8179Driver>();
   testDirectSleep<Uc8279X4Driver>();
   testUltraChipAbsolute<Uc8179Driver>(true, 0, false);
