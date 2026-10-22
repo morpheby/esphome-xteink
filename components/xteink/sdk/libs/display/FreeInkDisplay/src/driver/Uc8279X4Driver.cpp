@@ -529,6 +529,18 @@ void Uc8279X4Driver::displayFinish(EpdBus& bus, const uint8_t* fb) {
   }
 }
 
+void Uc8279X4Driver::seedPreviousFrame(EpdBus& bus, const uint8_t* buf) {
+  if (!buf) return;
+  // Deep sleep resets the driver object and may invalidate the UC8279's OLD
+  // image RAM even though the electrophoretic image remains visible. Restore
+  // only that differential reference. Writing DTM2 here previously caused the
+  // retained native-gray image to bleed out over successive clock updates.
+  // No display-refresh command is issued, so the visible panel is untouched.
+  streamPlane(bus, CMD_DTM1, buf);
+  _oldPlaneValid = true;
+  _needFullClear = false;
+}
+
 void Uc8279X4Driver::requestResync(uint8_t settlePasses) {
   _grayImagePass = false;
   _absoluteInput = false;
