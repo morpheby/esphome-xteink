@@ -26,6 +26,12 @@ class XteinkDisplay : public display::DisplayBuffer {
   void set_grayscale_settle_time(uint32_t settle_time) { this->grayscale_settle_time_ = settle_time; }
   void postpone_grayscale_settle();
   void prepare_page_change();
+  void begin_retained_frame_bootstrap();
+  bool retained_frame_ready() const { return this->retained_frame_adopted_; }
+  bool has_retained_frame_tag() const;
+  uint32_t get_retained_frame_tag() const;
+  void set_retained_frame_tag(uint32_t tag);
+  void clear_retained_frame_tag();
   bool settle_grayscale();
   bool flush_for_deep_sleep();
   display::DisplayType get_display_type() override {
@@ -60,6 +66,8 @@ class XteinkDisplay : public display::DisplayBuffer {
   bool grayscale_has_settled_{false};
   bool interactive_preview_requested_{false};
   bool force_full_refresh_{false};
+  bool retained_frame_bootstrap_pending_{false};
+  bool retained_frame_adopted_{false};
   bool grayscale_dirty_valid_{false};
   bool grayscale_dirty_full_{false};
   int grayscale_dirty_x0_{0};

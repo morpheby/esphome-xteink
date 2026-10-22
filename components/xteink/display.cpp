@@ -5,12 +5,46 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <esp_attr.h>
 #include <esp_heap_caps.h>
 
 namespace esphome {
 namespace xteink {
 
 static const char *const TAG = "xteink.display";
+
+struct RetainedFrameTag {
+  uint32_t magic;
+  uint32_t value;
+  uint32_t check;
+};
+
+static constexpr uint32_t RETAINED_FRAME_TAG_MAGIC = 0x58544652;  // "XTFR"
+// RTC_NOINIT_ATTR survives deep sleep without causing a flash write. Integrity
+// fields make power-on garbage or a power loss fail closed into a normal full
+// refresh.
+static RTC_NOINIT_ATTR RetainedFrameTag retained_frame_tag;
+
+bool XteinkDisplay::has_retained_frame_tag() const {
+  return retained_frame_tag.magic == RETAINED_FRAME_TAG_MAGIC &&
+         retained_frame_tag.check == (retained_frame_tag.value ^ RETAINED_FRAME_TAG_MAGIC);
+}
+
+uint32_t XteinkDisplay::get_retained_frame_tag() const {
+  return this->has_retained_frame_tag() ? retained_frame_tag.value : 0;
+}
+
+void XteinkDisplay::set_retained_frame_tag(uint32_t tag) {
+  retained_frame_tag.value = tag;
+  retained_frame_tag.check = tag ^ RETAINED_FRAME_TAG_MAGIC;
+  retained_frame_tag.magic = RETAINED_FRAME_TAG_MAGIC;
+}
+
+void XteinkDisplay::clear_retained_frame_tag() {
+  retained_frame_tag.magic = 0;
+  retained_frame_tag.value = 0;
+  retained_frame_tag.check = 0;
+}
 
 void XteinkDisplay::setup() {
   // update_when_display_idle uses this component's loop state as the display
@@ -385,6 +419,15 @@ void XteinkDisplay::prepare_page_change() {
   this->interactive_preview_requested_ = true;
 }
 
+void XteinkDisplay::begin_retained_frame_bootstrap() {
+  // A deep-sleep application can deterministically rebuild the exact frame it
+  // left on the non-volatile panel. Let LVGL paint that frame into fresh host
+  // buffers, then adopt it as the differential baseline without touching the
+  // panel. The next real update can therefore remain a small fast diff.
+  this->retained_frame_adopted_ = false;
+  this->retained_frame_bootstrap_pending_ = true;
+}
+
 bool XteinkDisplay::settle_grayscale() {
   // Timer-wake shutdown can request the final native-gray frame immediately
   // after LVGL submits its dithered preview. Drain that pending waveform first
@@ -529,6 +572,34 @@ void XteinkDisplay::update() {
   }
   if (!this->buffer_dirty_) {
     ESP_LOGV(TAG, "Skipping panel refresh: framebuffer is unchanged");
+    return;
+  }
+
+  if (this->retained_frame_bootstrap_pending_) {
+    this->retained_frame_bootstrap_pending_ = false;
+
+    // A settled adaptive frame consists of the solid B/W base plus native-gray
+    // overlay masks. Rebuild both so erased anti-aliased pixels remain part of
+    // the first zoned update after wake.
+    if (this->grayscale_available_ && this->grayscale_strategy_ == GRAYSCALE_ADAPTIVE) {
+      this->render_grayscale_overlay_();
+      this->native_grayscale_on_panel_ = true;
+      this->grayscale_has_settled_ = true;
+    }
+#ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
+    epd.swapBuffers();
+#endif
+    epd.syncWriteBufferFromActive();
+    this->has_drawn_ = true;
+    this->buffer_dirty_ = false;
+    this->force_full_refresh_ = false;
+    this->interactive_preview_requested_ = false;
+    this->cancel_timeout("grayscale_interactive_preview");
+    this->cancel_timeout("grayscale_settle");
+    this->grayscale_settle_pending_ = false;
+    this->clear_grayscale_dirty_();
+    this->retained_frame_adopted_ = true;
+    ESP_LOGD(TAG, "Adopted reconstructed retained frame without refreshing the panel");
     return;
   }
 
