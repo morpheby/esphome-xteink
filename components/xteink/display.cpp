@@ -107,6 +107,31 @@ void XteinkDisplay::setup() {
     this->grayscale_warning_logged_ = true;
     return;
   }
+  if (this->grayscale_strategy_ == GRAYSCALE_ADAPTIVE) {
+    // Connected-component expansion needs one visited bit per pixel and a
+    // bounded work queue. Keeping these buffers for the component lifetime
+    // avoids repeated PSRAM allocations on every small telemetry update.
+    this->gray_flood_queue_capacity_ = std::min<size_t>(this->gray_luma_size_, 32768);
+#if defined(BOARD_HAS_PSRAM)
+    this->gray_flood_visited_ =
+        static_cast<uint8_t *>(heap_caps_malloc(this->gray_buffer_size_, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    this->gray_flood_queue_ = static_cast<uint32_t *>(heap_caps_malloc(
+        this->gray_flood_queue_capacity_ * sizeof(uint32_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+#endif
+    if (this->gray_flood_visited_ == nullptr)
+      this->gray_flood_visited_ = static_cast<uint8_t *>(malloc(this->gray_buffer_size_));
+    if (this->gray_flood_queue_ == nullptr)
+      this->gray_flood_queue_ =
+          static_cast<uint32_t *>(malloc(this->gray_flood_queue_capacity_ * sizeof(uint32_t)));
+    if (this->gray_flood_visited_ == nullptr || this->gray_flood_queue_ == nullptr) {
+      free(this->gray_flood_visited_);
+      free(this->gray_flood_queue_);
+      this->gray_flood_visited_ = nullptr;
+      this->gray_flood_queue_ = nullptr;
+      this->gray_flood_queue_capacity_ = 0;
+      ESP_LOGW(TAG, "Could not allocate grayscale region workspace; changed gray regions will settle full-screen");
+    }
+  }
   memset(this->gray_luma_, 0xFF, this->gray_luma_size_);
   if (this->uses_native_grayscale_planes_()) {
     memset(this->gray_lsb_, 0xFF, this->gray_buffer_size_);
@@ -211,6 +236,8 @@ void XteinkDisplay::expand_grayscale_dirty_to_neighbors_() {
     return;
 
   auto &epd = this->parent_->display();
+  const int width = epd.getDisplayWidth();
+  const int height = epd.getDisplayHeight();
   const int max_x = epd.getDisplayWidth() - 1;
   const int max_y = epd.getDisplayHeight() - 1;
   int x0 = this->grayscale_dirty_x0_;
@@ -218,51 +245,63 @@ void XteinkDisplay::expand_grayscale_dirty_to_neighbors_() {
   int x1 = this->grayscale_dirty_x1_;
   int y1 = this->grayscale_dirty_y1_;
 
-  // Grow the rectangle one row/column at a time while its perimeter touches
-  // intermediate-gray pixels. This follows connected antialiasing, arcs, and
-  // fills to their object boundary without forcing an unrelated full-screen
-  // settle. Including the one-pixel corners makes diagonal AA connectivity
-  // count as neighboring too.
-  bool expanded;
-  do {
-    expanded = false;
-    if (x0 > 0) {
-      for (int y = std::max(0, y0 - 1); y <= std::min(max_y, y1 + 1); y++) {
-        if (this->is_grayscale_neighbor_(x0 - 1, y)) {
-          x0--;
-          expanded = true;
-          break;
-        }
-      }
+  if (this->gray_flood_visited_ == nullptr || this->gray_flood_queue_ == nullptr) {
+    this->mark_grayscale_full_();
+    return;
+  }
+
+  // A rectangle-edge flood is subtly wrong here: one gray pixel anywhere on
+  // an edge grows the whole edge, which can capture an unrelated glyph on the
+  // next row and repeat all the way down the display. Instead, seed every gray
+  // pixel touched by the dirty rectangle and follow only genuinely connected
+  // (8-neighbour) old/new gray pixels. Static gray objects already intersected
+  // by the update rectangle are included in full, but aligned objects separated
+  // by white space cannot pull the rectangle toward them.
+  memset(this->gray_flood_visited_, 0, this->gray_buffer_size_);
+  size_t head = 0;
+  size_t tail = 0;
+  bool overflow = false;
+  auto enqueue = [&](int x, int y) {
+    if (overflow || x < 0 || y < 0 || x >= width || y >= height ||
+        !this->is_grayscale_neighbor_(x, y))
+      return;
+    const uint32_t idx = static_cast<uint32_t>(y) * width + x;
+    const size_t byte = idx >> 3;
+    const uint8_t bit = static_cast<uint8_t>(0x80 >> (idx & 7));
+    if ((this->gray_flood_visited_[byte] & bit) != 0)
+      return;
+    if (tail >= this->gray_flood_queue_capacity_) {
+      overflow = true;
+      return;
     }
-    if (x1 < max_x) {
-      for (int y = std::max(0, y0 - 1); y <= std::min(max_y, y1 + 1); y++) {
-        if (this->is_grayscale_neighbor_(x1 + 1, y)) {
-          x1++;
-          expanded = true;
-          break;
-        }
-      }
-    }
-    if (y0 > 0) {
-      for (int x = std::max(0, x0 - 1); x <= std::min(max_x, x1 + 1); x++) {
-        if (this->is_grayscale_neighbor_(x, y0 - 1)) {
-          y0--;
-          expanded = true;
-          break;
-        }
-      }
-    }
-    if (y1 < max_y) {
-      for (int x = std::max(0, x0 - 1); x <= std::min(max_x, x1 + 1); x++) {
-        if (this->is_grayscale_neighbor_(x, y1 + 1)) {
-          y1++;
-          expanded = true;
-          break;
-        }
-      }
-    }
-  } while (expanded);
+    this->gray_flood_visited_[byte] |= bit;
+    this->gray_flood_queue_[tail++] = idx;
+  };
+
+  for (int y = std::max(0, y0 - 1); y <= std::min(max_y, y1 + 1); y++)
+    for (int x = std::max(0, x0 - 1); x <= std::min(max_x, x1 + 1); x++)
+      enqueue(x, y);
+
+  while (head < tail && !overflow) {
+    const uint32_t idx = this->gray_flood_queue_[head++];
+    const int x = idx % width;
+    const int y = idx / width;
+    x0 = std::min(x0, x);
+    y0 = std::min(y0, y);
+    x1 = std::max(x1, x);
+    y1 = std::max(y1, y);
+    for (int dy = -1; dy <= 1; dy++)
+      for (int dx = -1; dx <= 1; dx++)
+        if (dx != 0 || dy != 0)
+          enqueue(x + dx, y + dy);
+  }
+
+  if (overflow) {
+    // An unusually large connected gray image is safer and cheaper to settle
+    // as one full update than to truncate the component at an arbitrary edge.
+    this->mark_grayscale_full_();
+    return;
+  }
 
   this->grayscale_dirty_x0_ = x0;
   this->grayscale_dirty_y0_ = y0;
