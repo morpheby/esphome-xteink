@@ -1,3 +1,4 @@
+/Users/morpheby/.rvm/scripts/rvm:29: operation not permitted: ps
 #include "display.h"
 
 #include "esphome/core/log.h"
@@ -387,13 +388,23 @@ bool XteinkDisplay::render_ordered_dither_() {
 }
 
 void XteinkDisplay::schedule_grayscale_settle_() {
-  if (this->grayscale_strategy_ != GRAYSCALE_ADAPTIVE || !this->grayscale_available_)
+  if (this->virtual_update_active_ || this->grayscale_strategy_ != GRAYSCALE_ADAPTIVE ||
+      !this->grayscale_available_)
     return;
   this->grayscale_settle_pending_ = true;
   this->set_timeout("grayscale_settle", this->grayscale_settle_time_, [this]() { this->settle_grayscale(); });
 }
 
 void XteinkDisplay::postpone_grayscale_settle() {
+  if (this->virtual_update_active_) {
+    // Touch updates can continue while a slider or retained-frame bootstrap is
+    // rendering virtually. They must not re-arm an interactive panel preview.
+    this->interactive_preview_requested_ = false;
+    this->cancel_timeout("grayscale_interactive_preview");
+    this->cancel_timeout("grayscale_settle");
+    this->grayscale_settle_pending_ = false;
+    return;
+  }
   if (this->grayscale_strategy_ == GRAYSCALE_ADAPTIVE && this->grayscale_available_) {
     // activity() runs immediately before LVGL dispatches the button/page event.
     // Mark that next draw as latency-sensitive so it receives an immediate
@@ -423,17 +434,56 @@ void XteinkDisplay::prepare_page_change() {
   this->interactive_preview_requested_ = true;
 }
 
+void XteinkDisplay::begin_virtual_update() {
+  this->virtual_update_active_ = true;
+  this->interactive_preview_requested_ = false;
+  this->cancel_timeout("grayscale_interactive_preview");
+  this->cancel_timeout("grayscale_settle");
+  this->grayscale_settle_pending_ = false;
+}
+
+void XteinkDisplay::end_virtual_update(bool refresh) {
+  if (!this->virtual_update_active_)
+    return;
+  this->virtual_update_active_ = false;
+  if (!refresh)
+    return;
+
+  // Virtual draws have already populated the framebuffer and accumulated the
+  // grayscale dirty bounds. Submit that final state once, without asking LVGL
+  // to redraw the gesture's intermediate frames.
+  this->buffer_dirty_ = this->buffer_dirty_ || this->grayscale_dirty_valid_;
+  this->update();
+}
+
 void XteinkDisplay::begin_retained_frame_bootstrap() {
   // Let LVGL rebuild the exact retained frame into fresh host buffers while
   // panel writes are suppressed. The following clock-only mutation can then be
   // reduced to its normal dirty rectangle without redrawing unrelated pixels.
   this->retained_frame_adopted_ = false;
   this->retained_frame_bootstrap_pending_ = true;
+  this->begin_virtual_update();
   if (this->has_retained_frame_tag())
     this->partial_refresh_count_ = retained_frame_tag.partial_refreshes;
 }
 
+void XteinkDisplay::end_retained_frame_bootstrap() {
+  this->end_virtual_update(false);
+  // A full LVGL reconstruction can be delivered as several display flushes.
+  // Every one of them describes the already-visible retained frame, so none of
+  // their dirty bounds may leak into the following clock-only mutation.
+  this->buffer_dirty_ = false;
+  this->clear_grayscale_dirty_();
+}
+
 bool XteinkDisplay::settle_grayscale() {
+  if (this->virtual_update_active_) {
+    // A virtual frame is deliberately not a controller transaction. Leave its
+    // luma and dirty bounds intact for the first real mutation after resume.
+    this->cancel_timeout("grayscale_settle");
+    this->grayscale_settle_pending_ = false;
+    return false;
+  }
   // Timer-wake shutdown can request the final native-gray frame immediately
   // after LVGL submits its dithered preview. Drain that pending waveform first
   // so the settled frame is guaranteed to reach the panel before deep sleep.
@@ -499,6 +549,8 @@ bool XteinkDisplay::settle_grayscale() {
 }
 
 bool XteinkDisplay::flush_for_deep_sleep() {
+  if (this->virtual_update_active_)
+    return false;
   // LVGL can finish drawing into the host framebuffer shortly before a sleep
   // script runs. settle_grayscale() only refines a frame which has already
   // reached the panel, so first submit any dirty B/W preview and synchronously
@@ -583,6 +635,14 @@ void XteinkDisplay::update() {
   }
   if (!this->buffer_dirty_) {
     ESP_LOGV(TAG, "Skipping panel refresh: framebuffer is unchanged");
+    return;
+  }
+
+  if (this->virtual_update_active_ && !this->retained_frame_bootstrap_pending_) {
+    // LVGL may flush many areas during a drag. Keep composing them into the
+    // host buffers, but never schedule a waveform or alter controller state.
+    this->buffer_dirty_ = false;
+    ESP_LOGV(TAG, "Skipping panel refresh: virtual update is active");
     return;
   }
 
