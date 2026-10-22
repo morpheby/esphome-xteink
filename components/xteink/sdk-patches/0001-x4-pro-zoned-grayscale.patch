@@ -53,14 +53,27 @@ index ae67da5..36f00af 100644
 +    (void)h;
 +  }
 diff --git a/libs/display/FreeInkDisplay/src/driver/Uc8279X4Driver.cpp b/libs/display/FreeInkDisplay/src/driver/Uc8279X4Driver.cpp
-index a6e96e4..84b8630 100644
+index a6e96e4..bdfacec 100644
 --- a/libs/display/FreeInkDisplay/src/driver/Uc8279X4Driver.cpp
 +++ b/libs/display/FreeInkDisplay/src/driver/Uc8279X4Driver.cpp
 @@ -292,0 +293 @@ void Uc8279X4Driver::begin(EpdBus& bus) {
 +  _grayscaleWindowEnabled = false;
-@@ -534,0 +536 @@ void Uc8279X4Driver::requestResync(uint8_t settlePasses) {
+@@ -530,0 +532,12 @@ void Uc8279X4Driver::displayFinish(EpdBus& bus, const uint8_t* fb) {
++void Uc8279X4Driver::seedPreviousFrame(EpdBus& bus, const uint8_t* buf) {
++  if (!buf) return;
++  // Deep sleep resets the driver object and may invalidate the UC8279's OLD
++  // image RAM even though the electrophoretic image remains visible. Restore
++  // only that differential reference. Writing DTM2 here previously caused the
++  // retained native-gray image to bleed out over successive clock updates.
++  // No display-refresh command is issued, so the visible panel is untouched.
++  streamPlane(bus, CMD_DTM1, buf);
++  _oldPlaneValid = true;
++  _needFullClear = false;
++}
++
+@@ -534,0 +548 @@ void Uc8279X4Driver::requestResync(uint8_t settlePasses) {
 +  _grayscaleWindowEnabled = false;
-@@ -540 +542,15 @@ void Uc8279X4Driver::skipInitialResync() { _needFullClear = false; }
+@@ -539 +553,15 @@ void Uc8279X4Driver::requestResync(uint8_t settlePasses) {
 -void Uc8279X4Driver::skipInitialResync() { _needFullClear = false; }
 +void Uc8279X4Driver::skipInitialResync() {
 +  // The caller has reconstructed the exact retained frame in its host buffers.
@@ -77,9 +90,9 @@ index a6e96e4..84b8630 100644
 +  _directGrayOnPanel = false;
 +  _grayscaleWindowEnabled = false;
 +}
-@@ -545,0 +562 @@ void Uc8279X4Driver::deepSleep(EpdBus& bus) {
+@@ -545,0 +574 @@ void Uc8279X4Driver::deepSleep(EpdBus& bus) {
 +  _grayscaleWindowEnabled = false;
-@@ -574,0 +592,53 @@ GrayscaleCapabilities Uc8279X4Driver::grayscaleCapabilities(GrayscaleMode mode)
+@@ -574,0 +604,53 @@ GrayscaleCapabilities Uc8279X4Driver::grayscaleCapabilities(GrayscaleMode mode)
 +void Uc8279X4Driver::setGrayscaleWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
 +  if (w == 0 || h == 0 || x >= _w || y >= _h) {
 +    _grayscaleWindowEnabled = false;
@@ -133,17 +146,17 @@ index a6e96e4..84b8630 100644
 +  bus.data(0x01);
 +}
 +
-@@ -678,0 +749,4 @@ void Uc8279X4Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, c
+@@ -678,0 +761,4 @@ void Uc8279X4Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, c
 +  const bool windowed = _grayscaleWindowEnabled;
 +  if (windowed)
 +    enterGrayscaleWindow(bus);
 +
-@@ -685,0 +760,2 @@ void Uc8279X4Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, c
+@@ -685,0 +772,2 @@ void Uc8279X4Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, c
 +  if (windowed)
 +    bus.cmd(CMD_PARTIAL_OUT);
-@@ -719,0 +796 @@ void Uc8279X4Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, c
+@@ -719,0 +808 @@ void Uc8279X4Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, c
 +  _grayscaleWindowEnabled = false;
-@@ -771,14 +848 @@ void Uc8279X4Driver::runGrayscalePrecondition(EpdBus& bus) {
+@@ -771,14 +860 @@ void Uc8279X4Driver::runGrayscalePrecondition(EpdBus& bus) {
 -  const uint16_t xEnd = static_cast<uint16_t>(_w - 1);
 -  const uint16_t yStart = _cfg.gateOffset;
 -  const uint16_t yEnd = static_cast<uint16_t>(_cfg.gateOffset + _h - 1);
@@ -160,22 +173,24 @@ index a6e96e4..84b8630 100644
 -  bus.data(0x01);
 +  enterGrayscaleWindow(bus);
 diff --git a/libs/display/FreeInkDisplay/src/driver/Uc8279X4Driver.h b/libs/display/FreeInkDisplay/src/driver/Uc8279X4Driver.h
-index 2b05596..c04eb80 100644
+index 2b05596..0948c6c 100644
 --- a/libs/display/FreeInkDisplay/src/driver/Uc8279X4Driver.h
 +++ b/libs/display/FreeInkDisplay/src/driver/Uc8279X4Driver.h
-@@ -104,0 +105,2 @@ class Uc8279X4Driver : public PanelDriver {
+@@ -78,0 +79 @@ class Uc8279X4Driver : public PanelDriver {
++  void seedPreviousFrame(EpdBus& bus, const uint8_t* buf) override;
+@@ -104,0 +106,2 @@ class Uc8279X4Driver : public PanelDriver {
 +  void preserveGrayscaleOnFastRefresh() override { _redriveAfterGray = false; }
 +  void setGrayscaleWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h) override;
-@@ -131,0 +134 @@ class Uc8279X4Driver : public PanelDriver {
+@@ -131,0 +135 @@ class Uc8279X4Driver : public PanelDriver {
 +  void enterGrayscaleWindow(EpdBus& bus);
-@@ -164,0 +168,5 @@ class Uc8279X4Driver : public PanelDriver {
+@@ -164,0 +169,5 @@ class Uc8279X4Driver : public PanelDriver {
 +  bool _grayscaleWindowEnabled = false;
 +  uint16_t _grayscaleWindowX = 0;
 +  uint16_t _grayscaleWindowY = 0;
 +  uint16_t _grayscaleWindowW = 0;
 +  uint16_t _grayscaleWindowH = 0;
 diff --git a/libs/display/FreeInkDisplay/test/host/test_pro.cpp b/libs/display/FreeInkDisplay/test/host/test_pro.cpp
-index e498b0d..e18ca53 100644
+index e498b0d..3b5acc0 100644
 --- a/libs/display/FreeInkDisplay/test/host/test_pro.cpp
 +++ b/libs/display/FreeInkDisplay/test/host/test_pro.cpp
 @@ -24,0 +25,7 @@ static uint8_t lastRegister(const EpdBus& bus, uint8_t command) {
@@ -186,7 +201,7 @@ index e498b0d..e18ca53 100644
 +  return bus.writes.front();
 +}
 +
-@@ -507,0 +515,37 @@ static void testUc8279X4WaveformSelection() {
+@@ -507,0 +515,47 @@ static void testUc8279X4WaveformSelection() {
 +  driver._redriveAfterGray = true;
 +  driver.preserveGrayscaleOnFastRefresh();
 +  assert(!driver._redriveAfterGray);
@@ -204,6 +219,16 @@ index e498b0d..e18ca53 100644
 +  assert(driver._oldPlaneValid);
 +  assert(!driver._needFullClear);
 +  assert(!driver._redriveAfterGray);
++
++  bus.clear();
++  const auto retained = frame(39);
++  driver.seedPreviousFrame(bus, retained.data());
++  assert(std::count_if(bus.writes.begin(), bus.writes.end(),
++                       [](const auto& w) { return w.command == 0x10; }) == 1);
++  assert(std::count_if(bus.writes.begin(), bus.writes.end(),
++                       [](const auto& w) { return w.command == 0x13; }) == 0);
++  assert(std::count_if(bus.writes.begin(), bus.writes.end(),
++                       [](const auto& w) { return w.command == 0x12; }) == 0);
 +  driver.setGrayscaleWindow(13, 17, 22, 31);
 +
 +  bus.clear();
@@ -224,5 +249,5 @@ index e498b0d..e18ca53 100644
 +  assert(std::count_if(bus.writes.begin(), bus.writes.end(),
 +                       [](const auto& w) { return w.command == 0x92; }) == 1);
 +  assert(!driver._grayscaleWindowEnabled);
-@@ -543,0 +584 @@ int main(int argc, char**) {
+@@ -539,0 +594 @@ int main(int argc, char**) {
 +  testUc8279X4GrayscaleWindow();
