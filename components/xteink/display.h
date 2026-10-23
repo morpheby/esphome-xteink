@@ -44,9 +44,11 @@ class XteinkDisplay : public display::DisplayBuffer {
   // Stop deferred display work without starting another panel transaction.
   // Use after the caller has already observed its required refresh complete.
   void freeze_for_deep_sleep();
-  // Run the manual full-panel black/white/four-tone conditioning sequence.
-  // The caller can rebuild its UI into the final clean white buffers.
-  bool condition_panel();
+  // Run manual full-panel conditioning as scheduler-sized transactions. The
+  // caller must yield between the 16 steps, then rebuild its UI after end.
+  bool begin_panel_conditioning();
+  bool condition_panel_step(uint8_t step);
+  void end_panel_conditioning();
   display::DisplayType get_display_type() override {
     return this->grayscale_enabled_ ? display::DisplayType::DISPLAY_TYPE_GRAYSCALE
                                     : display::DisplayType::DISPLAY_TYPE_BINARY;
@@ -80,6 +82,7 @@ class XteinkDisplay : public display::DisplayBuffer {
   bool interactive_preview_requested_{false};
   bool force_full_refresh_{false};
   bool virtual_update_active_{false};
+  bool conditioning_active_{false};
   bool sleep_preparing_{false};
   bool retained_frame_bootstrap_pending_{false};
   bool retained_frame_adopted_{false};

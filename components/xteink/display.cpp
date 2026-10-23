@@ -685,19 +685,26 @@ void XteinkDisplay::freeze_for_deep_sleep() {
   this->clear_grayscale_dirty_();
 }
 
-bool XteinkDisplay::condition_panel() {
+bool XteinkDisplay::begin_panel_conditioning() {
   if (this->virtual_update_active_ || this->sleep_preparing_ || !this->grayscale_available_ ||
       !this->uses_native_grayscale_planes_())
     return false;
 
-  // Conditioning is intentionally synchronous and user-triggered. Drain the
-  // last ordinary refresh first, then cancel deferred adaptive-gray work so it
-  // cannot interleave with either full-screen phase.
+  // Drain the last ordinary refresh first, then cancel deferred adaptive-gray
+  // work so it cannot interleave with the manual sequence.
   this->finish_pending_refresh_(true);
   this->cancel_timeout("grayscale_interactive_preview");
   this->cancel_timeout("grayscale_settle");
   this->grayscale_settle_pending_ = false;
   this->interactive_preview_requested_ = false;
+  this->conditioning_active_ = true;
+  ESP_LOGI(TAG, "Panel conditioning started");
+  return true;
+}
+
+bool XteinkDisplay::condition_panel_step(uint8_t step) {
+  if (!this->conditioning_active_ || step >= 16)
+    return false;
 
   auto &epd = this->parent_->display();
   auto show_bw = [&](uint8_t value) {
@@ -724,25 +731,35 @@ bool XteinkDisplay::condition_panel() {
     return true;
   };
 
-  // Requested conditioning pattern, with n=3 for this panel's four native
-  // levels. The explicit B/W phases use the controller's strong full waveform;
-  // the sweeps use the panel-validated adaptive-overlay encoding.
-  show_bw(0x00);  // black
-  show_bw(0xFF);  // white
-  show_bw(0x00);  // black
-  for (uint8_t level = 0; level <= 3; level++) {
-    if (!show_gray(level))
-      return false;
+  // black -> white -> black -> gray[0..3] -> white -> black -> white ->
+  // gray[3..0] -> black -> white. One call performs exactly one waveform so
+  // ESPHome can return to its scheduler and feed the watchdog between steps.
+  static constexpr int8_t PHASES[16] = {
+      -1, -2, -1, 0, 1, 2, 3, -2, -1, -2, 3, 2, 1, 0, -1, -2,
+  };
+  const int8_t phase = PHASES[step];
+  if (phase == -1)
+    ESP_LOGD(TAG, "Panel conditioning step %u/16 (black)", step + 1);
+  else if (phase == -2)
+    ESP_LOGD(TAG, "Panel conditioning step %u/16 (white)", step + 1);
+  else
+    ESP_LOGD(TAG, "Panel conditioning step %u/16 (gray %d)", step + 1, phase);
+  if (phase == -1) {
+    show_bw(0x00);
+    return true;
   }
-  show_bw(0xFF);  // white
-  show_bw(0x00);  // black
-  show_bw(0xFF);  // white
-  for (int level = 3; level >= 0; level--) {
-    if (!show_gray(static_cast<uint8_t>(level)))
-      return false;
+  if (phase == -2) {
+    show_bw(0xFF);
+    return true;
   }
-  show_bw(0x00);  // black
-  show_bw(0xFF);  // white, final clean baseline
+  return show_gray(static_cast<uint8_t>(phase));
+}
+
+void XteinkDisplay::end_panel_conditioning() {
+  if (!this->conditioning_active_)
+    return;
+  auto &epd = this->parent_->display();
+  epd.setGrayscaleWindow(0, 0, 0, 0);
   epd.syncWriteBufferFromActive();
 
   // Both host buffers now describe the white panel. LVGL will reconstruct the
@@ -761,7 +778,8 @@ bool XteinkDisplay::condition_panel() {
   this->buffer_dirty_ = false;
   this->partial_refresh_count_ = 0;
   this->clear_grayscale_dirty_();
-  return true;
+  this->conditioning_active_ = false;
+  ESP_LOGI(TAG, "Panel conditioning finished");
 }
 
 void XteinkDisplay::finalize_refresh_(EInkDisplay::RefreshMode mode) {
@@ -819,7 +837,7 @@ void XteinkDisplay::draw_pixels_at(int x_start, int y_start, int w, int h, const
 }
 
 void XteinkDisplay::update() {
-  if (this->sleep_preparing_)
+  if (this->sleep_preparing_ || this->conditioning_active_)
     return;
   // LVGL's update_when_display_idle gate should prevent this, but keep the
   // framebuffer ownership invariant explicit if another caller invokes update.
