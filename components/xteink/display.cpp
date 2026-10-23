@@ -1,4 +1,3 @@
-/Users/morpheby/.rvm/scripts/rvm:29: operation not permitted: ps
 #include "display.h"
 
 #include "esphome/core/log.h"
@@ -684,6 +683,77 @@ void XteinkDisplay::freeze_for_deep_sleep() {
   this->interactive_preview_requested_ = false;
   this->buffer_dirty_ = false;
   this->clear_grayscale_dirty_();
+}
+
+bool XteinkDisplay::condition_panel() {
+  if (this->virtual_update_active_ || this->sleep_preparing_ || !this->grayscale_available_ ||
+      !this->uses_native_grayscale_planes_())
+    return false;
+
+  // Conditioning is intentionally synchronous and user-triggered. Drain the
+  // last ordinary refresh first, then cancel deferred adaptive-gray work so it
+  // cannot interleave with either full-screen phase.
+  this->finish_pending_refresh_(true);
+  this->cancel_timeout("grayscale_interactive_preview");
+  this->cancel_timeout("grayscale_settle");
+  this->grayscale_settle_pending_ = false;
+  this->interactive_preview_requested_ = false;
+
+  auto &epd = this->parent_->display();
+  auto show_bw = [&](uint8_t value) {
+    epd.clearScreen(value);
+    epd.displayBuffer(EInkDisplay::FULL_REFRESH);
+    this->update_count++;
+  };
+  auto show_gray = [&](uint8_t level) {
+    if (!epd.displayGrayscaleBase(freeink::GrayscaleMode::Direct, EInkDisplay::FULL_REFRESH))
+      return false;
+    memset(this->gray_lsb_, (level & 1U) != 0 ? 0xFF : 0x00, this->gray_buffer_size_);
+    memset(this->gray_msb_, (level & 2U) != 0 ? 0xFF : 0x00, this->gray_buffer_size_);
+    epd.copyGrayscaleBuffers(this->gray_lsb_, this->gray_msb_);
+    epd.displayGrayBuffer();
+    this->update_count++;
+    return true;
+  };
+
+  // Requested conditioning pattern, with n=3 for this panel's four native
+  // levels. The explicit B/W phases use the controller's strong full waveform;
+  // the sweeps use direct absolute four-tone planes.
+  show_bw(0x00);  // black
+  show_bw(0xFF);  // white
+  show_bw(0x00);  // black
+  for (uint8_t level = 0; level <= 3; level++) {
+    if (!show_gray(level))
+      return false;
+  }
+  show_bw(0xFF);  // white
+  show_bw(0x00);  // black
+  show_bw(0xFF);  // white
+  for (int level = 3; level >= 0; level--) {
+    if (!show_gray(static_cast<uint8_t>(level)))
+      return false;
+  }
+  show_bw(0x00);  // black
+  show_bw(0xFF);  // white, final clean baseline
+  epd.syncWriteBufferFromActive();
+
+  // Both host buffers now describe the white panel. LVGL will reconstruct the
+  // requested page virtually and submit it once as a new full baseline.
+  if (this->grayscale_available_) {
+    memset(this->gray_luma_, 0xFF, this->gray_luma_size_);
+    if (this->uses_native_grayscale_planes_()) {
+      memset(this->gray_lsb_, 0xFF, this->gray_buffer_size_);
+      memset(this->gray_msb_, 0xFF, this->gray_buffer_size_);
+    }
+  }
+  this->has_drawn_ = false;
+  this->native_grayscale_on_panel_ = false;
+  this->grayscale_has_settled_ = false;
+  this->force_full_refresh_ = true;
+  this->buffer_dirty_ = false;
+  this->partial_refresh_count_ = 0;
+  this->clear_grayscale_dirty_();
+  return true;
 }
 
 void XteinkDisplay::finalize_refresh_(EInkDisplay::RefreshMode mode) {
