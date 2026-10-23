@@ -713,20 +713,16 @@ bool XteinkDisplay::condition_panel_step(uint8_t step) {
     this->update_count++;
   };
   auto show_gray = [&](uint8_t level) {
-    // Use the same overlay encoding and waveform that adaptive UI grayscale
-    // uses on the physical X4 Pro. The direct full-image waveform is a useful
-    // capability for artwork, but it did not produce visible intermediate
-    // tones on this panel during conditioning.
-    uint8_t *base = epd.getFrameBuffer();
-    memset(base, level == 3 ? 0xFF : 0x00, this->gray_buffer_size_);
-    memset(this->gray_lsb_, level == 1 ? 0xFF : 0x00, this->gray_buffer_size_);
-    memset(this->gray_msb_, (level == 1 || level == 2) ? 0xFF : 0x00, this->gray_buffer_size_);
+    // A conditioning sweep needs a single combined waveform per solid level.
+    // Overlay mode is deliberately unsuitable: it first paints a B/W base and
+    // then applies gray masks, producing a black/white flash before every tone.
+    memset(this->gray_lsb_, (level & 1U) != 0 ? 0xFF : 0x00, this->gray_buffer_size_);
+    memset(this->gray_msb_, (level & 2U) != 0 ? 0xFF : 0x00, this->gray_buffer_size_);
     epd.setGrayscaleWindow(0, 0, 0, 0);
-    if (!epd.displayGrayscaleBase(freeink::GrayscaleMode::Overlay, EInkDisplay::FAST_REFRESH))
+    if (!epd.displayGrayscaleBase(freeink::GrayscaleMode::Direct, EInkDisplay::FAST_REFRESH))
       return false;
     epd.copyGrayscaleBuffers(this->gray_lsb_, this->gray_msb_);
     epd.displayGrayBuffer();
-    epd.cleanupGrayscaleBuffers(base);
     this->update_count++;
     return true;
   };
