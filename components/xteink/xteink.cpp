@@ -1,2 +1,179 @@
-ıK®Ïæ¢ºay¼¿®ù¿±Êâ¦Û?®ù¶öŠ^­«b¢yè¶—«š+myÚlm«ëˆ§½©buªàºg§·õ,z»?šŠé…æòÿ
-+’ÊZqïŞ²˜h™ìmz)äıÊ&¦‰ŞÛ?Æ×¢Oñµè§‘ÊiRÆ y¶¬{®vçºh¢ø¥zŠ.µø¥y¶ëy©­æ¤zw(uçhºÚn¶êbÚ%Šw¬¡ù^aéƒu×œ¡×yÊz)éºØazZ]ŠÊek+aŠÉ²Æ z(§¦ëb›­~)^uçÚº[_¢»-v)è¢ëiºÚ.¶›­~)^uçÚº[_¢»-v‹­
+#include "xteink.h"
+
+#include "esphome/core/application.h"
+#include "esphome/core/log.h"
+
+#include <XteinkDetect.h>
+#include <driver/gpio.h>
+#include <esp_attr.h>
+#include <esp_sleep.h>
+
+namespace esphome {
+namespace xteink {
+
+static const char *const TAG = "xteink";
+
+struct RetainedControllerTag {
+  uint32_t magic;
+  uint8_t controller;
+  uint8_t variant;
+  uint16_t reserved;
+  uint32_t check;
+};
+
+static constexpr uint32_t RETAINED_CONTROLLER_MAGIC = 0x58544352;  // "XTCR"
+static RTC_NOINIT_ATTR RetainedControllerTag retained_controller_tag;
+
+static bool retained_controller_tag_valid() {
+  const uint32_t value = static_cast<uint32_t>(retained_controller_tag.controller) |
+                         (static_cast<uint32_t>(retained_controller_tag.variant) << 8);
+  return retained_controller_tag.magic == RETAINED_CONTROLLER_MAGIC &&
+         retained_controller_tag.check == (RETAINED_CONTROLLER_MAGIC ^ value);
+}
+
+static void clear_retained_controller_tag() {
+  retained_controller_tag.magic = 0;
+  retained_controller_tag.controller = 0;
+  retained_controller_tag.variant = 0;
+  retained_controller_tag.reserved = 0;
+  retained_controller_tag.check = 0;
+}
+
+static void save_retained_controller_tag() {
+  retained_controller_tag.controller = static_cast<uint8_t>(BoardConfig::ACTIVE.displayController);
+  retained_controller_tag.variant = BoardConfig::ACTIVE.displayControllerVariant;
+  retained_controller_tag.reserved = 0;
+  const uint32_t value = static_cast<uint32_t>(retained_controller_tag.controller) |
+                         (static_cast<uint32_t>(retained_controller_tag.variant) << 8);
+  retained_controller_tag.check = RETAINED_CONTROLLER_MAGIC ^ value;
+  retained_controller_tag.magic = RETAINED_CONTROLLER_MAGIC;
+}
+
+void Xteink::setup() {
+  // Battery-latched boards (X4 Pro's GPIO1 peripheral rail) power off without this.
+  BoardConfig::holdPowerRails();
+  // X3: GPIO13 is the SD rail enable and shares SCLK/MOSI with the panel. on_powerdown()
+  // holds it LOW and the hold survives the wake reset; an unpowered card clamps the bus
+  // and the controller probe below goes deaf. No-op on boards without a switched SD rail.
+  BoardConfig::releaseSdRail();
+  const auto wake_cause = esp_sleep_get_wakeup_cause();
+  const bool deep_sleep_wake = wake_cause != ESP_SLEEP_WAKEUP_UNDEFINED;
+  const bool restore_controller = deep_sleep_wake && retained_controller_tag_valid() &&
+                                  retained_controller_tag.controller ==
+                                      static_cast<uint8_t>(BoardConfig::DisplayController::UC8279);
+  if (restore_controller) {
+    BoardConfig::ACTIVE.displayController = BoardConfig::DisplayController::UC8279;
+    BoardConfig::ACTIVE.displayControllerVariant = retained_controller_tag.variant;
+    ESP_LOGI(TAG, "Restoring retained UC8279 controller state (variant 0x%02X)",
+             retained_controller_tag.variant);
+  } else {
+    clear_retained_controller_tag();
+  }
+  // Newer panel batches ship an UltraChip controller in place of the SSD1677/UC8253;
+  // probe the bus and promote the profile before the driver is selected in begin().
+  if (!restore_controller && freeink::applyXteinkDisplayController()) {
+    ESP_LOGI(TAG, "UltraChip panel controller detected, driver promoted");
+  }
+#if FREEINK_DEVICE_X3
+  if (BoardConfig::ACTIVE.displayController == BoardConfig::DisplayController::UC8279) {
+    BoardConfig::selectDevice(BoardConfig::Board::XteinkX3Uc8279);
+  }
+  this->display_.setDisplayX3();
+#endif
+  this->display_.begin(restore_controller);
+  this->controller_state_retained_ = restore_controller && this->display_.supportsRetainedController();
+  this->input_.begin();
+}
+
+void Xteink::update() {
+  this->input_.update();
+  if (this->input_.wasHomeKeyPressed()) {
+    this->home_pressed_ = true;
+  }
+}
+
+bool Xteink::take_home_press() {
+  bool pressed = this->home_pressed_;
+  this->home_pressed_ = false;
+  return pressed;
+}
+
+// Drive `pin` to `level` and latch it so the level survives deep sleep.
+// gpio_hold_dis first: a hold left from a previous cycle makes the write a no-op.
+static void hold_pin(int8_t pin, int level) {
+  if (pin < 0)
+    return;
+  const auto g = static_cast<gpio_num_t>(pin);
+  gpio_hold_dis(g);
+  gpio_set_direction(g, GPIO_MODE_OUTPUT);
+  gpio_set_level(g, level);
+  gpio_hold_en(g);
+}
+
+void Xteink::on_powerdown() {
+  // Park the panel. The UC8279 X4 Pro path disables its charge pumps but keeps
+  // controller RAM alive; other panels use their normal deep-sleep sequence.
+  // Feed the watchdog through whatever BUSY wait remains so a slow power-off
+  // cannot trip the 5 s task watchdog instead of sleeping.
+  this->display_.setBusyWaitSliceHook([](int8_t, uint8_t) {
+    App.feed_wdt();
+    delay(1);
+    return true;
+  });
+  const bool retain_controller = BoardConfig::isX4Pro() && this->display_.sleepRetainingController();
+  if (retain_controller)
+    save_retained_controller_tag();
+  else {
+    clear_retained_controller_tag();
+    this->display_.deepSleep();
+  }
+
+  const auto &b = BoardConfig::ACTIVE;
+  // Panel RESET must not float through sleep: a transient reset would discard a
+  // retained controller image; on other panels it can also restart the booster.
+  // Mirrors the SDK PowerManager: LOW alongside a switched-off panel rail, HIGH
+  // when the rail stays powered (X4/X3). EpdBus::begin() releases the hold on wake.
+  hold_pin(b.display.rst, b.display.powerEnable >= 0 ? 0 : 1);
+  hold_pin(b.display.powerEnable, 0);
+  // Power latches. X4 (C3): GPIO13 gates the battery MOSFET and driving it LOW
+  // is the real power-off, as CrossPoint does â€” on battery the whole board goes
+  // dark (zero drain; the power button bridges the rail again and we cold-boot),
+  // on USB the chip stays up and falls through to deep sleep + GPIO3 wake.
+  // `hold_battery_latch: true` keeps it HIGH instead so the RTC timer can wake
+  // the board (a dashboard). That costs ~3-4 mA on the X4 PCB even in deep
+  // sleep (unswitched SD slot, battery divider, LDO): ~5-6 days on 650 mAh.
+  // The X3 has no battery latch (its GPIO13 is the SD rail, cut below): the chip
+  // stays powered and deep-sleeps, so RTC timer wake works there on battery.
+  // Other boards' latches are keep-alive enables (X4 Pro GPIO1): hold them HIGH.
+  // Measured before this: ~5 %/h drained while "asleep", same as awake.
+#if FREEINK_MCU_C3 && !XTEINK_HOLD_BATTERY_LATCH
+  const int latch_level = 0;
+#else
+  const int latch_level = 1;
+#endif
+  hold_pin(b.power.latch0, latch_level);
+  hold_pin(b.power.latch1, latch_level);
+  // Loads that stay on a rail held alive (X4 Pro): the GT911 has its own enable
+  // (GPIO2, active-LOW, so HIGH = off) and the frontlight LED drivers hang off
+  // active-HIGH PWM pads that must not float. No-ops where a profile leaves the
+  // pins unassigned. XteinkFrontlight::setup() releases these holds at boot.
+  hold_pin(b.touch.powerEnable, b.touch.powerEnableActiveHigh ? 0 : 1);
+  // Switched SD rail (X3 GPIO13, active-high): otherwise the card stays powered
+  // through sleep. setup() releases this hold before the display probe.
+  hold_pin(b.sd.powerEnable, b.sd.powerActiveHigh ? 0 : 1);
+  hold_pin(b.frontlight.gpio, b.frontlight.activeHigh ? 0 : 1);
+  hold_pin(b.frontlight.gpioWarm, b.frontlight.activeHigh ? 0 : 1);
+  // Everything not held floats isolated (no leakage through SPI/DC/CS pads); the
+  // holds themselves survive deep sleep. Same sequence as PowerManager::deepSleep().
+  esp_sleep_config_gpio_isolate();
+  gpio_deep_sleep_hold_en();
+}
+
+void Xteink::dump_config() {
+  ESP_LOGCONFIG(TAG, "Xteink:\n  Board: %s\n  Panel: %ux%u", BoardConfig::ACTIVE.name,
+                this->display_.getDisplayWidth(), this->display_.getDisplayHeight());
+  LOG_UPDATE_INTERVAL(this);
+}
+
+}  // namespace xteink
+}  // namespace esphome
