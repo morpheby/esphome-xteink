@@ -74,6 +74,7 @@ class XteinkDisplay : public display::DisplayBuffer {
   bool interactive_preview_requested_{false};
   bool force_full_refresh_{false};
   bool virtual_update_active_{false};
+  bool sleep_preparing_{false};
   bool retained_frame_bootstrap_pending_{false};
   bool retained_frame_adopted_{false};
   bool grayscale_dirty_valid_{false};
@@ -82,6 +83,7 @@ class XteinkDisplay : public display::DisplayBuffer {
   int grayscale_dirty_y0_{0};
   int grayscale_dirty_x1_{0};
   int grayscale_dirty_y1_{0};
+  uint32_t grayscale_dirty_generation_{0};
   GrayscaleStrategy grayscale_strategy_{GRAYSCALE_NATIVE};
   uint32_t grayscale_settle_time_{5000};
   uint32_t full_refresh_every_{0};
@@ -101,6 +103,7 @@ class XteinkDisplay : public display::DisplayBuffer {
   void render_grayscale_overlay_();
   bool render_ordered_dither_();
   void mark_grayscale_dirty_(int x, int y);
+  void mark_grayscale_dirty_rect_(int x, int y, int w, int h);
   void mark_grayscale_full_();
   void clear_grayscale_dirty_();
   void expand_grayscale_dirty_to_neighbors_();

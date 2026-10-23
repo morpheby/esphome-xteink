@@ -188,6 +188,7 @@ void XteinkDisplay::draw_absolute_pixel_internal(int x, int y, Color color) {
 }
 
 void XteinkDisplay::mark_grayscale_dirty_(int x, int y) {
+  this->grayscale_dirty_generation_++;
   if (this->grayscale_dirty_full_)
     return;
   if (!this->grayscale_dirty_valid_) {
@@ -204,6 +205,32 @@ void XteinkDisplay::mark_grayscale_dirty_(int x, int y) {
     this->grayscale_dirty_y0_ = y;
   if (y > this->grayscale_dirty_y1_)
     this->grayscale_dirty_y1_ = y;
+}
+
+void XteinkDisplay::mark_grayscale_dirty_rect_(int x, int y, int w, int h) {
+  if (this->grayscale_dirty_full_ || w <= 0 || h <= 0)
+    return;
+
+  auto &epd = this->parent_->display();
+  const int x0 = std::max(0, x);
+  const int y0 = std::max(0, y);
+  const int x1 = std::min(epd.getDisplayWidth() - 1, x + w - 1);
+  const int y1 = std::min(epd.getDisplayHeight() - 1, y + h - 1);
+  if (x0 > x1 || y0 > y1)
+    return;
+
+  if (!this->grayscale_dirty_valid_) {
+    this->grayscale_dirty_x0_ = x0;
+    this->grayscale_dirty_y0_ = y0;
+    this->grayscale_dirty_x1_ = x1;
+    this->grayscale_dirty_y1_ = y1;
+    this->grayscale_dirty_valid_ = true;
+    return;
+  }
+  this->grayscale_dirty_x0_ = std::min(this->grayscale_dirty_x0_, x0);
+  this->grayscale_dirty_y0_ = std::min(this->grayscale_dirty_y0_, y0);
+  this->grayscale_dirty_x1_ = std::max(this->grayscale_dirty_x1_, x1);
+  this->grayscale_dirty_y1_ = std::max(this->grayscale_dirty_y1_, y1);
 }
 
 void XteinkDisplay::mark_grayscale_full_() {
@@ -427,7 +454,8 @@ bool XteinkDisplay::render_ordered_dither_() {
 }
 
 void XteinkDisplay::schedule_grayscale_settle_() {
-  if (this->virtual_update_active_ || this->grayscale_strategy_ != GRAYSCALE_ADAPTIVE ||
+  if (this->virtual_update_active_ || this->sleep_preparing_ ||
+      this->grayscale_strategy_ != GRAYSCALE_ADAPTIVE ||
       !this->grayscale_available_)
     return;
   this->grayscale_settle_pending_ = true;
@@ -605,10 +633,20 @@ bool XteinkDisplay::flush_for_deep_sleep() {
     this->finish_pending_refresh_(true);
   }
 
+  bool flushed = this->has_drawn_;
   if (this->grayscale_strategy_ == GRAYSCALE_ADAPTIVE && this->grayscale_available_ &&
       this->grayscale_dirty_valid_)
-    return this->settle_grayscale();
-  return this->has_drawn_;
+    flushed = this->settle_grayscale();
+
+  // No panel transaction may begin after this point. ESPHome tears down API
+  // and Wi-Fi before on_powerdown(), and the retained-controller path must not
+  // discover a newly queued async refresh there and wait with services already
+  // gone. A fresh component instance clears this automatically on wake.
+  this->sleep_preparing_ = true;
+  this->cancel_timeout("grayscale_interactive_preview");
+  this->cancel_timeout("grayscale_settle");
+  this->grayscale_settle_pending_ = false;
+  return flushed;
 }
 
 void XteinkDisplay::finalize_refresh_(EInkDisplay::RefreshMode mode) {
@@ -650,12 +688,24 @@ void XteinkDisplay::loop() { this->finish_pending_refresh_(false); }
 void XteinkDisplay::draw_pixels_at(int x_start, int y_start, int w, int h, const uint8_t *ptr,
                                    display::ColorOrder order, display::ColorBitness bitness, bool big_endian,
                                    int x_offset, int y_offset, int x_pad) {
+  const uint32_t dirty_generation = this->grayscale_dirty_generation_;
   this->rgb_input_ = true;
   display::Display::draw_pixels_at(x_start, y_start, w, h, ptr, order, bitness, big_endian, x_offset, y_offset, x_pad);
   this->rgb_input_ = false;
+  if (this->grayscale_strategy_ == GRAYSCALE_ADAPTIVE &&
+      this->grayscale_dirty_generation_ != dirty_generation) {
+    // LVGL already computed the semantic invalidation rectangle for this draw.
+    // Keep all of it: antialiased glyph edges are split into gray islands by
+    // solid black strokes, so pixel-only connected-component growth can clip
+    // parts of the same label. The generation guard prevents unchanged LVGL
+    // flushes from broadening a genuinely small gray update.
+    this->mark_grayscale_dirty_rect_(x_start, y_start, w, h);
+  }
 }
 
 void XteinkDisplay::update() {
+  if (this->sleep_preparing_)
+    return;
   // LVGL's update_when_display_idle gate should prevent this, but keep the
   // framebuffer ownership invariant explicit if another caller invokes update.
   if (this->refresh_pending_)
