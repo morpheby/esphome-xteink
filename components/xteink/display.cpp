@@ -540,7 +540,12 @@ bool XteinkDisplay::settle_grayscale() {
   const bool zoned = this->grayscale_has_settled_ && !this->grayscale_dirty_full_ && !periodic_full;
   if (zoned) {
     this->expand_grayscale_dirty_to_neighbors_();
-    constexpr int MARGIN = 4;
+    // Keep the physical PTL boundary outside the anti-aliased object itself.
+    // Four pixels was enough for the luma mask but left the UC8279 window edge
+    // close enough to small changing labels to accumulate a visible underline
+    // and damaged digit strokes. Connected-component expansion still prevents
+    // this padding from pulling unrelated widgets into the update.
+    constexpr int MARGIN = 12;
     const int x0 = std::max(0, this->grayscale_dirty_x0_ - MARGIN);
     const int y0 = std::max(0, this->grayscale_dirty_y0_ - MARGIN);
     const int x1 = std::min(epd.getDisplayWidth() - 1, this->grayscale_dirty_x1_ + MARGIN);

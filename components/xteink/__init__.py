@@ -24,6 +24,10 @@ CONF_XTEINK_ID = "xteink_id"
 # X4 only: keep the GPIO13 battery MOSFET on through deep sleep so the RTC timer can
 # wake the board. Costs ~3-4 mA asleep on that PCB; off = a real power cut, button wake only.
 CONF_HOLD_BATTERY_LATCH = "hold_battery_latch"
+# X4 Pro only: use controller power-off (POF) while the MCU sleeps, preserving
+# controller RAM/registers for differential wake updates. False sends the normal
+# deep-sleep command (DSLP); the first display update after wake is then full.
+CONF_RETAIN_DISPLAY_CONTROLLER = "retain_display_controller"
 
 # model -> (esp32 variant, FreeInk device flag)
 MODELS = {
@@ -49,6 +53,7 @@ CONFIG_SCHEMA = cv.Schema(
         cv.GenerateID(): cv.declare_id(Xteink),
         cv.Required(CONF_MODEL): cv.one_of(*MODELS, lower=True),
         cv.Optional(CONF_HOLD_BATTERY_LATCH, default=False): cv.boolean,
+        cv.Optional(CONF_RETAIN_DISPLAY_CONTROLLER, default=False): cv.boolean,
     }
 ).extend(cv.polling_component_schema("50ms"))
 
@@ -79,6 +84,10 @@ def _final_validate(config):
     if have != want:
         raise cv.Invalid(
             f"xteink model '{config[CONF_MODEL]}' is an {want} device but esp32 variant is {have}"
+        )
+    if config[CONF_RETAIN_DISPLAY_CONTROLLER] and config[CONF_MODEL] != "x4_pro":
+        raise cv.Invalid(
+            "retain_display_controller is currently supported only on x4_pro"
         )
     return config
 
@@ -182,4 +191,5 @@ async def to_code(config):
     cg.add_library("Wire", None)
 
     var = cg.new_Pvariable(config[CONF_ID])
+    cg.add(var.set_retain_display_controller(config[CONF_RETAIN_DISPLAY_CONTROLLER]))
     await cg.register_component(var, config)

@@ -90,18 +90,34 @@ index ae67da5..be8ea41 100644
 +    (void)h;
 +  }
 diff --git a/libs/display/FreeInkDisplay/src/driver/Uc8279X4Driver.cpp b/libs/display/FreeInkDisplay/src/driver/Uc8279X4Driver.cpp
-index a6e96e4..5cf7b31 100644
+index a6e96e4..8bc89a9 100644
 --- a/libs/display/FreeInkDisplay/src/driver/Uc8279X4Driver.cpp
 +++ b/libs/display/FreeInkDisplay/src/driver/Uc8279X4Driver.cpp
-@@ -285 +285 @@ void Uc8279X4Driver::initController(EpdBus& bus) {
+@@ -44,0 +45,15 @@ constexpr uint8_t CMD_TSSET = 0xE5;               // TSSET (forced temperature)
++// Shutdown must never strand the host after ESPHome has already torn down its
++// API and OTA services. POF normally returns BUSY_N high quickly, but a panel
++// whose pin remains asserted must not turn a controller wait into an infinite
++// MCU-awake state. Two seconds is far longer than the configured PFS sequence;
++// after it, proceed with shutdown. A non-retained wake resets and fully redraws
++// the controller, while a retained wake has a full minute before its next PON.
++constexpr unsigned long POWER_OFF_BUSY_TIMEOUT_MS = 2000;
++
++void waitPowerOffBounded(EpdBus& bus) {
++  delay(1);  // allow the low-active BUSY_N assertion to become visible
++  const unsigned long started = millis();
++  while (bus.isBusy() && millis() - started < POWER_OFF_BUSY_TIMEOUT_MS)
++    delay(1);
++}
++
+@@ -285 +300 @@ void Uc8279X4Driver::initController(EpdBus& bus) {
 -void Uc8279X4Driver::begin(EpdBus& bus) {
 +void Uc8279X4Driver::resetRuntimeState(bool retained) {
-@@ -290,2 +290,2 @@ void Uc8279X4Driver::begin(EpdBus& bus) {
+@@ -290,2 +305,2 @@ void Uc8279X4Driver::begin(EpdBus& bus) {
 -  _oldPlaneValid = false;
 -  _needFullClear = true;
 +  _oldPlaneValid = retained;
 +  _needFullClear = !retained;
-@@ -293,2 +293,11 @@ void Uc8279X4Driver::begin(EpdBus& bus) {
+@@ -293,2 +308,11 @@ void Uc8279X4Driver::begin(EpdBus& bus) {
 -  bus.reset(50);
 -  initController(bus);
 +  _grayscaleWindowEnabled = false;
@@ -115,7 +131,7 @@ index a6e96e4..5cf7b31 100644
 +}
 +
 +void Uc8279X4Driver::ensureGrayScratch() {
-@@ -302,2 +311,16 @@ void Uc8279X4Driver::begin(EpdBus& bus) {
+@@ -302,2 +326,16 @@ void Uc8279X4Driver::begin(EpdBus& bus) {
 -  _grayBaseValid = false;
 -  _absoluteGrayPlanes = false;
 +}
@@ -134,7 +150,7 @@ index a6e96e4..5cf7b31 100644
 +  // C++ object's volatile bookkeeping and scratch allocation.
 +  resetRuntimeState(true);
 +  ensureGrayScratch();
-@@ -530,0 +554,11 @@ void Uc8279X4Driver::displayFinish(EpdBus& bus, const uint8_t* fb) {
+@@ -530,0 +569,11 @@ void Uc8279X4Driver::displayFinish(EpdBus& bus, const uint8_t* fb) {
 +void Uc8279X4Driver::seedPreviousFrame(EpdBus& bus, const uint8_t* buf) {
 +  if (!buf) return;
 +  // Re-establish only the differential OLD reference for callers explicitly
@@ -146,9 +162,9 @@ index a6e96e4..5cf7b31 100644
 +  _needFullClear = false;
 +}
 +
-@@ -534,0 +569 @@ void Uc8279X4Driver::requestResync(uint8_t settlePasses) {
+@@ -534,0 +584 @@ void Uc8279X4Driver::requestResync(uint8_t settlePasses) {
 +  _grayscaleWindowEnabled = false;
-@@ -539 +574,15 @@ void Uc8279X4Driver::requestResync(uint8_t settlePasses) {
+@@ -539 +589,15 @@ void Uc8279X4Driver::requestResync(uint8_t settlePasses) {
 -void Uc8279X4Driver::skipInitialResync() { _needFullClear = false; }
 +void Uc8279X4Driver::skipInitialResync() {
 +  // The caller has reconstructed the exact retained frame in its host buffers.
@@ -165,21 +181,24 @@ index a6e96e4..5cf7b31 100644
 +  _directGrayOnPanel = false;
 +  _grayscaleWindowEnabled = false;
 +}
-@@ -545,0 +595 @@ void Uc8279X4Driver::deepSleep(EpdBus& bus) {
+@@ -545,0 +610 @@ void Uc8279X4Driver::deepSleep(EpdBus& bus) {
 +  _grayscaleWindowEnabled = false;
-@@ -554,0 +605,11 @@ void Uc8279X4Driver::deepSleep(EpdBus& bus) {
+@@ -548 +613 @@ void Uc8279X4Driver::deepSleep(EpdBus& bus) {
+-    bus.waitBusy(" 8279x4 power-down");
++    waitPowerOffBounded(bus);
+@@ -554,0 +620,11 @@ void Uc8279X4Driver::deepSleep(EpdBus& bus) {
 +void Uc8279X4Driver::powerOffRetainingState(EpdBus& bus) {
 +  // POF disables the charge pumps but leaves controller RAM/register state
 +  // available for the next PON. Do not send DSLP: leaving it requires RESET,
 +  // which would destroy the differential and native-gray reference planes.
 +  if (_isScreenOn) {
 +    bus.cmd(CMD_POWER_OFF);
-+    bus.waitBusy(" 8279x4 retained power-down");
++    waitPowerOffBounded(bus);
 +    _isScreenOn = false;
 +  }
 +}
 +
-@@ -574,0 +636,53 @@ GrayscaleCapabilities Uc8279X4Driver::grayscaleCapabilities(GrayscaleMode mode)
+@@ -574,0 +651,53 @@ GrayscaleCapabilities Uc8279X4Driver::grayscaleCapabilities(GrayscaleMode mode)
 +void Uc8279X4Driver::setGrayscaleWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
 +  if (w == 0 || h == 0 || x >= _w || y >= _h) {
 +    _grayscaleWindowEnabled = false;
@@ -233,17 +252,17 @@ index a6e96e4..5cf7b31 100644
 +  bus.data(0x01);
 +}
 +
-@@ -678,0 +793,4 @@ void Uc8279X4Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, c
+@@ -678,0 +808,4 @@ void Uc8279X4Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, c
 +  const bool windowed = _grayscaleWindowEnabled;
 +  if (windowed)
 +    enterGrayscaleWindow(bus);
 +
-@@ -685,0 +804,2 @@ void Uc8279X4Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, c
+@@ -685,0 +819,2 @@ void Uc8279X4Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, c
 +  if (windowed)
 +    bus.cmd(CMD_PARTIAL_OUT);
-@@ -719,0 +840 @@ void Uc8279X4Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, c
+@@ -719,0 +855 @@ void Uc8279X4Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, c
 +  _grayscaleWindowEnabled = false;
-@@ -771,14 +892 @@ void Uc8279X4Driver::runGrayscalePrecondition(EpdBus& bus) {
+@@ -771,14 +907 @@ void Uc8279X4Driver::runGrayscalePrecondition(EpdBus& bus) {
 -  const uint16_t xEnd = static_cast<uint16_t>(_w - 1);
 -  const uint16_t yStart = _cfg.gateOffset;
 -  const uint16_t yEnd = static_cast<uint16_t>(_cfg.gateOffset + _h - 1);
@@ -283,8 +302,17 @@ index 2b05596..cf9642f 100644
 +  uint16_t _grayscaleWindowY = 0;
 +  uint16_t _grayscaleWindowW = 0;
 +  uint16_t _grayscaleWindowH = 0;
+diff --git a/libs/display/FreeInkDisplay/test/host/pro_stubs/EpdBus.h b/libs/display/FreeInkDisplay/test/host/pro_stubs/EpdBus.h
+index 69a5599..076ce25 100644
+--- a/libs/display/FreeInkDisplay/test/host/pro_stubs/EpdBus.h
++++ b/libs/display/FreeInkDisplay/test/host/pro_stubs/EpdBus.h
+@@ -12,0 +13 @@ class EpdBus {
++  bool busy=false;
+@@ -35 +36 @@ class EpdBus {
+-  bool isBusy() const { return false; }
++  bool isBusy() const { return busy; }
 diff --git a/libs/display/FreeInkDisplay/test/host/test_pro.cpp b/libs/display/FreeInkDisplay/test/host/test_pro.cpp
-index e498b0d..c199081 100644
+index e498b0d..9eb214f 100644
 --- a/libs/display/FreeInkDisplay/test/host/test_pro.cpp
 +++ b/libs/display/FreeInkDisplay/test/host/test_pro.cpp
 @@ -24,0 +25,7 @@ static uint8_t lastRegister(const EpdBus& bus, uint8_t command) {
@@ -295,7 +323,7 @@ index e498b0d..c199081 100644
 +  return bus.writes.front();
 +}
 +
-@@ -507,0 +515,67 @@ static void testUc8279X4WaveformSelection() {
+@@ -507,0 +515,70 @@ static void testUc8279X4WaveformSelection() {
 +  driver._redriveAfterGray = true;
 +  driver.preserveGrayscaleOnFastRefresh();
 +  assert(!driver._redriveAfterGray);
@@ -358,12 +386,15 @@ index e498b0d..c199081 100644
 +  assert(!driver._isScreenOn);
 +
 +  driver._isScreenOn = true;
++  // A stuck-low BUSY_N must not strand the host in the shutdown hook.
++  bus.busy = true;
 +  driver.powerOffRetainingState(bus);
++  assert(!driver._isScreenOn);
 +  assert(std::count_if(bus.writes.begin(), bus.writes.end(),
 +                       [](const auto& w) { return w.command == 0x02; }) == 1);
 +  assert(std::count_if(bus.writes.begin(), bus.writes.end(),
 +                       [](const auto& w) { return w.command == 0x07; }) == 0);
-@@ -539,0 +614 @@ int main(int argc, char**) {
+@@ -539,0 +617 @@ int main(int argc, char**) {
 +  testUc8279X4GrayscaleWindow();
-@@ -543,0 +619 @@ int main(int argc, char**) {
+@@ -543,0 +622 @@ int main(int argc, char**) {
 +  testUc8279X4RetainedLifecycle();

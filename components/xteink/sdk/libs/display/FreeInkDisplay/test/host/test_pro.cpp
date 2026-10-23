@@ -574,7 +574,10 @@ static void testUc8279X4RetainedLifecycle() {
   assert(!driver._isScreenOn);
 
   driver._isScreenOn = true;
+  // A stuck-low BUSY_N must not strand the host in the shutdown hook.
+  bus.busy = true;
   driver.powerOffRetainingState(bus);
+  assert(!driver._isScreenOn);
   assert(std::count_if(bus.writes.begin(), bus.writes.end(),
                        [](const auto& w) { return w.command == 0x02; }) == 1);
   assert(std::count_if(bus.writes.begin(), bus.writes.end(),

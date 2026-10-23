@@ -42,6 +42,21 @@ constexpr uint8_t CMD_CCSET = 0xE0;               // CCSET (cascade/output enabl
 constexpr uint8_t CMD_GATE_SCAN = 0xE1;           // gate-scan selection
 constexpr uint8_t CMD_TSSET = 0xE5;               // TSSET (forced temperature)
 
+// Shutdown must never strand the host after ESPHome has already torn down its
+// API and OTA services. POF normally returns BUSY_N high quickly, but a panel
+// whose pin remains asserted must not turn a controller wait into an infinite
+// MCU-awake state. Two seconds is far longer than the configured PFS sequence;
+// after it, proceed with shutdown. A non-retained wake resets and fully redraws
+// the controller, while a retained wake has a full minute before its next PON.
+constexpr unsigned long POWER_OFF_BUSY_TIMEOUT_MS = 2000;
+
+void waitPowerOffBounded(EpdBus& bus) {
+  delay(1);  // allow the low-active BUSY_N assertion to become visible
+  const unsigned long started = millis();
+  while (bus.isBusy() && millis() - started < POWER_OFF_BUSY_TIMEOUT_MS)
+    delay(1);
+}
+
 constexpr uint8_t GRAY_LUT_LEN = 49;
 struct GrayLut {
   uint8_t cmd;
@@ -595,7 +610,7 @@ void Uc8279X4Driver::deepSleep(EpdBus& bus) {
   _grayscaleWindowEnabled = false;
   if (_isScreenOn) {
     bus.cmd(CMD_POWER_OFF);
-    bus.waitBusy(" 8279x4 power-down");
+    waitPowerOffBounded(bus);
     _isScreenOn = false;
   }
   bus.cmd(CMD_DEEP_SLEEP);
@@ -608,7 +623,7 @@ void Uc8279X4Driver::powerOffRetainingState(EpdBus& bus) {
   // which would destroy the differential and native-gray reference planes.
   if (_isScreenOn) {
     bus.cmd(CMD_POWER_OFF);
-    bus.waitBusy(" 8279x4 retained power-down");
+    waitPowerOffBounded(bus);
     _isScreenOn = false;
   }
 }
