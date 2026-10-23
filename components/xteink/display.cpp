@@ -490,6 +490,14 @@ void XteinkDisplay::prepare_page_change() {
   if (this->grayscale_strategy_ != GRAYSCALE_ADAPTIVE || !this->grayscale_available_)
     return;
 
+  // This is intentionally one line per explicit page change, rather than per
+  // LVGL flush. It lets hardware testing distinguish a page that really had
+  // native gray on-panel from a binary fast refresh that merely left pixels at
+  // intermediate optical charge.
+  ESP_LOGD(TAG, "Page change: native_gray=%s settled=%s pending=%s partial_count=%lu",
+           YESNO(this->native_grayscale_on_panel_), YESNO(this->grayscale_has_settled_),
+           YESNO(this->grayscale_settle_pending_), static_cast<unsigned long>(this->partial_refresh_count_));
+
   this->mark_grayscale_full_();
   if (!this->grayscale_has_settled_)
     return;
@@ -703,7 +711,7 @@ bool XteinkDisplay::begin_panel_conditioning() {
 }
 
 bool XteinkDisplay::condition_panel_step(uint8_t step) {
-  if (!this->conditioning_active_ || step >= 16)
+  if (!this->conditioning_active_ || step >= CONDITIONING_TRANSACTION_COUNT)
     return false;
 
   auto &epd = this->parent_->display();
@@ -728,27 +736,49 @@ bool XteinkDisplay::condition_panel_step(uint8_t step) {
   };
 
   // black -> white -> black -> gray[0..3] -> white -> black -> white ->
-  // gray[3..0] -> black -> white. One call performs exactly one waveform so
-  // ESPHome can return to its scheduler and feed the watchdog between steps.
+  // gray[3..0] -> black -> white. Every explicit B/W phase starts with one
+  // strong full refresh and then repeats that endpoint with ten direct
+  // grayscale waveforms. Direct mode is important here: Overlay would repaint
+  // a B/W base before every pass, which made the sweep appear to contain only
+  // a single gray. One call still performs exactly one physical transaction so
+  // ESPHome can feed the watchdog and service API clients between passes.
   static constexpr int8_t PHASES[16] = {
       -1, -2, -1, 0, 1, 2, 3, -2, -1, -2, 3, 2, 1, 0, -1, -2,
   };
-  const int8_t phase = PHASES[step];
-  if (phase == -1)
-    ESP_LOGD(TAG, "Panel conditioning step %u/16 (black)", step + 1);
-  else if (phase == -2)
-    ESP_LOGD(TAG, "Panel conditioning step %u/16 (white)", step + 1);
-  else
-    ESP_LOGD(TAG, "Panel conditioning step %u/16 (gray %d)", step + 1, phase);
-  if (phase == -1) {
-    show_bw(0x00);
-    return true;
+  uint8_t first_transaction = 0;
+  for (uint8_t phase_index = 0; phase_index < 16; phase_index++) {
+    const int8_t phase = PHASES[phase_index];
+    const uint8_t transaction_count = phase < 0 ? 11 : 1;
+    if (step >= first_transaction + transaction_count) {
+      first_transaction += transaction_count;
+      continue;
+    }
+
+    const uint8_t pass = step - first_transaction;
+    if (phase == -1 && pass == 0) {
+      ESP_LOGD(TAG, "Panel conditioning transaction %u/%u (black full)", step + 1,
+               CONDITIONING_TRANSACTION_COUNT);
+      show_bw(0x00);
+      return true;
+    }
+    if (phase == -2 && pass == 0) {
+      ESP_LOGD(TAG, "Panel conditioning transaction %u/%u (white full)", step + 1,
+               CONDITIONING_TRANSACTION_COUNT);
+      show_bw(0xFF);
+      return true;
+    }
+    if (phase < 0) {
+      const uint8_t level = phase == -1 ? 0 : 3;
+      ESP_LOGD(TAG, "Panel conditioning transaction %u/%u (%s endpoint %u/10)", step + 1,
+               CONDITIONING_TRANSACTION_COUNT, phase == -1 ? "black" : "white", pass);
+      return show_gray(level);
+    }
+
+    ESP_LOGD(TAG, "Panel conditioning transaction %u/%u (gray %d)", step + 1,
+             CONDITIONING_TRANSACTION_COUNT, phase);
+    return show_gray(static_cast<uint8_t>(phase));
   }
-  if (phase == -2) {
-    show_bw(0xFF);
-    return true;
-  }
-  return show_gray(static_cast<uint8_t>(phase));
+  return false;
 }
 
 void XteinkDisplay::end_panel_conditioning() {

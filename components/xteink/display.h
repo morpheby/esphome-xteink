@@ -45,8 +45,11 @@ class XteinkDisplay : public display::DisplayBuffer {
   // Use after the caller has already observed its required refresh complete.
   void freeze_for_deep_sleep();
   // Run manual full-panel conditioning as scheduler-sized transactions. The
-  // caller must yield between the 16 steps, then rebuild its UI after end.
+  // caller must yield between all 96 transactions, then rebuild its UI after
+  // end. Every explicit B/W phase is one strong refresh plus ten same-color
+  // endpoint passes; grayscale sweep phases are one direct pass each.
   bool begin_panel_conditioning();
+  uint8_t panel_conditioning_transaction_count() const { return CONDITIONING_TRANSACTION_COUNT; }
   bool condition_panel_step(uint8_t step);
   void end_panel_conditioning();
   display::DisplayType get_display_type() override {
@@ -67,6 +70,7 @@ class XteinkDisplay : public display::DisplayBuffer {
   uint64_t update_count{0};  ///< number of panel refreshes so far, usable from the lambda
 
  protected:
+  static constexpr uint8_t CONDITIONING_TRANSACTION_COUNT = 96;
   Xteink *parent_{nullptr};
   optional<xteink_writer_t> writer_local_{};
   RefreshMode refresh_mode_{HALF_REFRESH};
