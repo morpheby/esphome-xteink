@@ -706,19 +706,27 @@ bool XteinkDisplay::condition_panel() {
     this->update_count++;
   };
   auto show_gray = [&](uint8_t level) {
-    if (!epd.displayGrayscaleBase(freeink::GrayscaleMode::Direct, EInkDisplay::FULL_REFRESH))
+    // Use the same overlay encoding and waveform that adaptive UI grayscale
+    // uses on the physical X4 Pro. The direct full-image waveform is a useful
+    // capability for artwork, but it did not produce visible intermediate
+    // tones on this panel during conditioning.
+    uint8_t *base = epd.getFrameBuffer();
+    memset(base, level == 3 ? 0xFF : 0x00, this->gray_buffer_size_);
+    memset(this->gray_lsb_, level == 1 ? 0xFF : 0x00, this->gray_buffer_size_);
+    memset(this->gray_msb_, (level == 1 || level == 2) ? 0xFF : 0x00, this->gray_buffer_size_);
+    epd.setGrayscaleWindow(0, 0, 0, 0);
+    if (!epd.displayGrayscaleBase(freeink::GrayscaleMode::Overlay, EInkDisplay::FAST_REFRESH))
       return false;
-    memset(this->gray_lsb_, (level & 1U) != 0 ? 0xFF : 0x00, this->gray_buffer_size_);
-    memset(this->gray_msb_, (level & 2U) != 0 ? 0xFF : 0x00, this->gray_buffer_size_);
     epd.copyGrayscaleBuffers(this->gray_lsb_, this->gray_msb_);
     epd.displayGrayBuffer();
+    epd.cleanupGrayscaleBuffers(base);
     this->update_count++;
     return true;
   };
 
   // Requested conditioning pattern, with n=3 for this panel's four native
   // levels. The explicit B/W phases use the controller's strong full waveform;
-  // the sweeps use direct absolute four-tone planes.
+  // the sweeps use the panel-validated adaptive-overlay encoding.
   show_bw(0x00);  // black
   show_bw(0xFF);  // white
   show_bw(0x00);  // black
