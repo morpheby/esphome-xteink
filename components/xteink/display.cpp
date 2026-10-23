@@ -1,3 +1,4 @@
+/Users/morpheby/.rvm/scripts/rvm:29: operation not permitted: ps
 #include "display.h"
 
 #include "esphome/core/log.h"
@@ -668,6 +669,21 @@ bool XteinkDisplay::flush_for_deep_sleep() {
   this->cancel_timeout("grayscale_settle");
   this->grayscale_settle_pending_ = false;
   return flushed;
+}
+
+void XteinkDisplay::freeze_for_deep_sleep() {
+  // A low-power caller may prefer the last completed frame over risking a new
+  // grayscale transaction at the sleep boundary. In particular, a deferred
+  // native-gray settle must never be allowed to keep the MCU awake after Wi-Fi
+  // has already been disabled. The component is recreated on the next wake, so
+  // discarding unsent dirty state here is intentional.
+  this->sleep_preparing_ = true;
+  this->cancel_timeout("grayscale_interactive_preview");
+  this->cancel_timeout("grayscale_settle");
+  this->grayscale_settle_pending_ = false;
+  this->interactive_preview_requested_ = false;
+  this->buffer_dirty_ = false;
+  this->clear_grayscale_dirty_();
 }
 
 void XteinkDisplay::finalize_refresh_(EInkDisplay::RefreshMode mode) {

@@ -1,3 +1,4 @@
+/Users/morpheby/.rvm/scripts/rvm:29: operation not permitted: ps
 #pragma once
 
 #include "esphome/components/display/display_buffer.h"
@@ -41,6 +42,9 @@ class XteinkDisplay : public display::DisplayBuffer {
   void clear_retained_frame_tag();
   bool settle_grayscale();
   bool flush_for_deep_sleep();
+  // Stop deferred display work without starting another panel transaction.
+  // Use after the caller has already observed its required refresh complete.
+  void freeze_for_deep_sleep();
   display::DisplayType get_display_type() override {
     return this->grayscale_enabled_ ? display::DisplayType::DISPLAY_TYPE_GRAYSCALE
                                     : display::DisplayType::DISPLAY_TYPE_BINARY;
