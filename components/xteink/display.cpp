@@ -536,6 +536,27 @@ void XteinkDisplay::begin_retained_frame_bootstrap() {
 
 void XteinkDisplay::end_retained_frame_bootstrap() {
   this->end_virtual_update(false);
+  if (this->retained_frame_adopted_) {
+    auto &epd = this->parent_->display();
+    // LVGL may deliver one forced redraw as several flushes. Keep composing
+    // all of them into the write buffer while panel I/O is suppressed, then
+    // build the clean B/W base from the completed luma frame exactly once.
+    // Making that completed buffer active here is essential: adopting the
+    // first flush left frameBufferActive holding only the top strip while the
+    // write buffer contained the rest of the page. The next differential or
+    // gray pass then used fragments of an older page as its OLD plane.
+    if (this->grayscale_available_ && this->grayscale_strategy_ == GRAYSCALE_ADAPTIVE) {
+      this->render_grayscale_overlay_();
+      this->native_grayscale_on_panel_ = true;
+      this->grayscale_has_settled_ = true;
+      epd.preserveGrayscaleOnFastRefresh();
+    }
+    epd.skipInitialResync();
+#ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
+    epd.swapBuffers();
+#endif
+    epd.syncWriteBufferFromActive();
+  }
   // A full LVGL reconstruction can be delivered as several display flushes.
   // Every one of them describes the already-visible retained frame, so none of
   // their dirty bounds may leak into the following clock-only mutation.
@@ -743,24 +764,10 @@ void XteinkDisplay::update() {
   if (this->retained_frame_bootstrap_pending_) {
     this->retained_frame_bootstrap_pending_ = false;
 
-    // Reconstruct the exact B/W base and native-gray masks in RAM, then adopt
-    // them without sending pixels to the panel. Do not rewrite the controller
-    // planes here: the panel/controller already retain the prior frame, and
-    // replacing both planes with a guessed binary base destroys that reference.
-    if (this->grayscale_available_ && this->grayscale_strategy_ == GRAYSCALE_ADAPTIVE) {
-      this->render_grayscale_overlay_();
-      this->native_grayscale_on_panel_ = true;
-      this->grayscale_has_settled_ = true;
-      epd.preserveGrayscaleOnFastRefresh();
-    }
-    epd.skipInitialResync();
-#ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
-    epd.swapBuffers();
-#endif
-    epd.syncWriteBufferFromActive();
-    // The controller stayed out of DSLP/RESET, so its OLD/NEW planes already
-    // describe the visible native-gray frame. Any RAM write here would replace
-    // that exact retained reference with an approximation.
+    // This is only the first flush of the reconstructed LVGL frame. Mark that
+    // rendering began, but leave the write/active buffer relationship alone:
+    // later flushes in the same redraw must remain virtual and land in the same
+    // write buffer. end_retained_frame_bootstrap() adopts the complete frame.
     this->has_drawn_ = true;
     this->buffer_dirty_ = false;
     this->force_full_refresh_ = false;
@@ -770,7 +777,7 @@ void XteinkDisplay::update() {
     this->grayscale_settle_pending_ = false;
     this->clear_grayscale_dirty_();
     this->retained_frame_adopted_ = true;
-    ESP_LOGD(TAG, "Reconstructed retained frame in RAM without refreshing the panel");
+    ESP_LOGD(TAG, "Retained-frame reconstruction started with panel writes suppressed");
     return;
   }
 
