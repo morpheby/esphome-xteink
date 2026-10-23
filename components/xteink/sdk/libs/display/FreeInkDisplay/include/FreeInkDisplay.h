@@ -73,7 +73,7 @@ class FreeInkDisplay {
   // periodic-full cadence (currently the EEGO A4's UC8279C driver).
   void setHoldPeriodicFullRefresh(bool hold);
 
-  void begin();
+  void begin(bool retainControllerState = false);
 
   // Legacy compile-time dimensions kept for compatibility.
   static constexpr uint16_t DISPLAY_WIDTH = 800;
@@ -299,6 +299,10 @@ class FreeInkDisplay {
 
   // Power management
   void deepSleep();
+  // Power down the panel's analog section without discarding controller RAM.
+  // Returns false when the selected driver cannot safely retain its state.
+  bool sleepRetainingController();
+  bool supportsRetainedController() const;
 
   // Optional hooks fired around long BUSY waits (~0.3-2 s per refresh), so host
   // firmware can apply its own power policy (e.g. reduce the CPU clock) for the

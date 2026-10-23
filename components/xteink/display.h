@@ -26,8 +26,32 @@ class XteinkDisplay : public display::DisplayBuffer {
   void set_grayscale_settle_time(uint32_t settle_time) { this->grayscale_settle_time_ = settle_time; }
   void postpone_grayscale_settle();
   void prepare_page_change();
+  // Render into the host framebuffer without touching controller RAM or the
+  // panel. This is used for retained-frame reconstruction and for high-rate UI
+  // gestures whose intermediate frames are not meaningful on e-paper.
+  void begin_virtual_update();
+  void end_virtual_update(bool refresh = false);
+  bool virtual_update_active() const { return this->virtual_update_active_; }
+  void begin_retained_frame_bootstrap();
+  void end_retained_frame_bootstrap();
+  bool retained_frame_ready() const { return this->retained_frame_adopted_; }
+  bool has_retained_frame_tag() const;
+  uint32_t get_retained_frame_tag() const;
+  void set_retained_frame_tag(uint32_t tag);
+  void clear_retained_frame_tag();
   bool settle_grayscale();
   bool flush_for_deep_sleep();
+  // Stop deferred display work without starting another panel transaction.
+  // Use after the caller has already observed its required refresh complete.
+  void freeze_for_deep_sleep();
+  // Run manual full-panel conditioning as scheduler-sized transactions. The
+  // caller must yield between all 96 transactions, then rebuild its UI after
+  // end. Every explicit B/W phase is one strong refresh plus ten same-color
+  // endpoint passes; grayscale sweep phases are one direct pass each.
+  bool begin_panel_conditioning();
+  uint8_t panel_conditioning_transaction_count() const { return CONDITIONING_TRANSACTION_COUNT; }
+  bool condition_panel_step(uint8_t step);
+  void end_panel_conditioning();
   display::DisplayType get_display_type() override {
     return this->grayscale_enabled_ ? display::DisplayType::DISPLAY_TYPE_GRAYSCALE
                                     : display::DisplayType::DISPLAY_TYPE_BINARY;
@@ -46,6 +70,7 @@ class XteinkDisplay : public display::DisplayBuffer {
   uint64_t update_count{0};  ///< number of panel refreshes so far, usable from the lambda
 
  protected:
+  static constexpr uint8_t CONDITIONING_TRANSACTION_COUNT = 96;
   Xteink *parent_{nullptr};
   optional<xteink_writer_t> writer_local_{};
   RefreshMode refresh_mode_{HALF_REFRESH};
@@ -60,12 +85,18 @@ class XteinkDisplay : public display::DisplayBuffer {
   bool grayscale_has_settled_{false};
   bool interactive_preview_requested_{false};
   bool force_full_refresh_{false};
+  bool virtual_update_active_{false};
+  bool conditioning_active_{false};
+  bool sleep_preparing_{false};
+  bool retained_frame_bootstrap_pending_{false};
+  bool retained_frame_adopted_{false};
   bool grayscale_dirty_valid_{false};
   bool grayscale_dirty_full_{false};
   int grayscale_dirty_x0_{0};
   int grayscale_dirty_y0_{0};
   int grayscale_dirty_x1_{0};
   int grayscale_dirty_y1_{0};
+  uint32_t grayscale_dirty_generation_{0};
   GrayscaleStrategy grayscale_strategy_{GRAYSCALE_NATIVE};
   uint32_t grayscale_settle_time_{5000};
   uint32_t full_refresh_every_{0};
@@ -75,6 +106,9 @@ class XteinkDisplay : public display::DisplayBuffer {
   uint8_t *gray_luma_{nullptr};
   uint8_t *gray_lsb_{nullptr};
   uint8_t *gray_msb_{nullptr};
+  uint8_t *gray_flood_visited_{nullptr};
+  uint32_t *gray_flood_queue_{nullptr};
+  size_t gray_flood_queue_capacity_{0};
   size_t gray_buffer_size_{0};
   size_t gray_luma_size_{0};
 
@@ -82,6 +116,7 @@ class XteinkDisplay : public display::DisplayBuffer {
   void render_grayscale_overlay_();
   bool render_ordered_dither_();
   void mark_grayscale_dirty_(int x, int y);
+  void mark_grayscale_dirty_rect_(int x, int y, int w, int h);
   void mark_grayscale_full_();
   void clear_grayscale_dirty_();
   void expand_grayscale_dirty_to_neighbors_();

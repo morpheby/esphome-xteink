@@ -48,6 +48,12 @@ class PanelDriver {
   // --- lifecycle ---
   virtual void begin(EpdBus& bus) = 0;
   virtual void deepSleep(EpdBus& bus) = 0;
+  // Controllers opting in here can keep their image RAM and waveform context
+  // while the host MCU deep-sleeps. The retained begin must configure only
+  // host-side bookkeeping; it must not reset or reinitialize the controller.
+  virtual bool supportsRetainedState() const { return false; }
+  virtual void beginRetained(EpdBus& bus) { begin(bus); }
+  virtual void powerOffRetainingState(EpdBus& bus) { deepSleep(bus); }
 
   // --- core paint path (load RAM + refresh) ---
   virtual void display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff) = 0;

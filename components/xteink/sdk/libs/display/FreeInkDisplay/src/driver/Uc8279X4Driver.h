@@ -71,11 +71,15 @@ class Uc8279X4Driver : public PanelDriver {
 
   void begin(EpdBus& bus) override;
   void deepSleep(EpdBus& bus) override;
+  bool supportsRetainedState() const override { return true; }
+  void beginRetained(EpdBus& bus) override;
+  void powerOffRetainingState(EpdBus& bus) override;
 
   void display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff) override;
   bool displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff) override;
   void displayFinish(EpdBus& bus, const uint8_t* fb) override;
   bool supportsAsyncDisplay() const override { return true; }
+  void seedPreviousFrame(EpdBus& bus, const uint8_t* buf) override;
 
   void requestResync(uint8_t settlePasses) override;
   void skipInitialResync() override;
@@ -114,6 +118,8 @@ class Uc8279X4Driver : public PanelDriver {
 
  private:
   void initController(EpdBus& bus);
+  void resetRuntimeState(bool retained);
+  void ensureGrayScratch();
   void startBwRefresh(EpdBus& bus, bool fast);
   // Stream a framebuffer into a RAM plane: 0xFF padding for gates before the
   // visible offset, visible rows in the stock convention (forward order, bytes

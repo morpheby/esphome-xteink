@@ -24,6 +24,8 @@ class Xteink : public PollingComponent {
   EInkDisplay &display() { return this->display_; }
   InputManager &input() { return this->input_; }
   BatteryMonitor &battery() { return this->battery_; }
+  void set_retain_display_controller(bool retain) { this->retain_display_controller_ = retain; }
+  bool controller_state_retained() const { return this->controller_state_retained_; }
   /// Returns true once per GT911 home-key press (X4 Pro); latched so a slower
   /// consumer cannot miss the one-update edge the SDK reports.
   bool take_home_press();
@@ -35,6 +37,8 @@ class Xteink : public PollingComponent {
   InputManager input_;
   BatteryMonitor battery_;
   bool home_pressed_{false};
+  bool retain_display_controller_{false};
+  bool controller_state_retained_{false};
 };
 
 }  // namespace xteink

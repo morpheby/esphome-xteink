@@ -10,6 +10,7 @@ class EpdBus {
   struct Write { uint8_t command; std::vector<uint8_t> bytes; unsigned transactions=0; };
   std::vector<Write> writes;
   bool transaction=false;
+  bool busy=false;
   unsigned waits=0;
   void clear() { assert(!transaction); writes.clear(); waits=0; }
   void begin(const EpdPins&, uint32_t, BusyPolarity, int8_t=-1, int8_t=-1) {}
@@ -32,7 +33,7 @@ class EpdBus {
   void reset(uint16_t=0) {}
   void waitBusy(const char* =nullptr) { assert(!transaction); ++waits; }
   void waitRefreshComplete(const char* =nullptr) { assert(!transaction); ++waits; }
-  bool isBusy() const { return false; }
+  bool isBusy() const { return busy; }
   EpdPins pins() const { return {}; }
   void setBusyWaitHooks(void (*)(), void (*)()) {}
   void setBusyWaitSliceHook(bool (*)(int8_t,uint8_t)) {}

@@ -522,9 +522,23 @@ static void testUc8279X4GrayscaleWindow() {
   Uc8279X4Driver driver;
   EpdBus bus;
   driver.begin(bus);
-  driver._grayRefreshedOnce = true;
-  driver._oldPlaneValid = true;
-  driver._needFullClear = false;
+  bus.clear();
+  driver.skipInitialResync();
+  assert(bus.writes.empty());
+  assert(driver._grayRefreshedOnce);
+  assert(driver._oldPlaneValid);
+  assert(!driver._needFullClear);
+  assert(!driver._redriveAfterGray);
+
+  bus.clear();
+  const auto retained = frame(39);
+  driver.seedPreviousFrame(bus, retained.data());
+  assert(std::count_if(bus.writes.begin(), bus.writes.end(),
+                       [](const auto& w) { return w.command == 0x10; }) == 1);
+  assert(std::count_if(bus.writes.begin(), bus.writes.end(),
+                       [](const auto& w) { return w.command == 0x13; }) == 0);
+  assert(std::count_if(bus.writes.begin(), bus.writes.end(),
+                       [](const auto& w) { return w.command == 0x12; }) == 0);
   driver.setGrayscaleWindow(13, 17, 22, 31);
 
   bus.clear();
@@ -545,6 +559,29 @@ static void testUc8279X4GrayscaleWindow() {
   assert(std::count_if(bus.writes.begin(), bus.writes.end(),
                        [](const auto& w) { return w.command == 0x92; }) == 1);
   assert(!driver._grayscaleWindowEnabled);
+  free(driver._grayBase);
+}
+
+static void testUc8279X4RetainedLifecycle() {
+  Uc8279X4Driver driver;
+  EpdBus bus;
+
+  driver.beginRetained(bus);
+  assert(bus.writes.empty());
+  assert(driver._oldPlaneValid);
+  assert(!driver._needFullClear);
+  assert(driver._grayRefreshedOnce);
+  assert(!driver._isScreenOn);
+
+  driver._isScreenOn = true;
+  // A stuck-low BUSY_N must not strand the host in the shutdown hook.
+  bus.busy = true;
+  driver.powerOffRetainingState(bus);
+  assert(!driver._isScreenOn);
+  assert(std::count_if(bus.writes.begin(), bus.writes.end(),
+                       [](const auto& w) { return w.command == 0x02; }) == 1);
+  assert(std::count_if(bus.writes.begin(), bus.writes.end(),
+                       [](const auto& w) { return w.command == 0x07; }) == 0);
   free(driver._grayBase);
 }
 
@@ -577,11 +614,12 @@ int main(int argc, char**) {
   if (argc > 1) {
     testStickyAbsolute();
     std::puts("Sticky absolute capability, activation, power-down and B/W recovery passed");
+  testUc8279X4GrayscaleWindow();
     return 0;
   }
   testUc8179GrayShadeSplit();
   testUc8279X4WaveformSelection();
-  testUc8279X4GrayscaleWindow();
+  testUc8279X4RetainedLifecycle();
   testDirectSleep<Uc8179Driver>();
   testDirectSleep<Uc8279X4Driver>();
   testUltraChipAbsolute<Uc8179Driver>(true, 0, false);

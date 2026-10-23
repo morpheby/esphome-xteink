@@ -190,7 +190,7 @@ void FreeInkDisplay::selectDriver() {
   if (_driver) _driver->setBackgroundHint(_inverted);
 }
 
-void FreeInkDisplay::begin() {
+void FreeInkDisplay::begin(bool retainControllerState) {
   cancelGrayscalePass();
   selectDriver();
 
@@ -230,7 +230,10 @@ void FreeInkDisplay::begin() {
   if (frameBuffer1) memset(frameBuffer1, 0xFF, bufferSize);
 #endif
 
-  _driver->begin(_bus);
+  if (retainControllerState && _driver->supportsRetainedState())
+    _driver->beginRetained(_bus);
+  else
+    _driver->begin(_bus);
 }
 
 // ============================================================================
@@ -1045,6 +1048,18 @@ void FreeInkDisplay::deepSleep() {
   cancelGrayscalePass();
   syncPendingAsync();
   if (_driver) _driver->deepSleep(_bus);
+}
+
+bool FreeInkDisplay::sleepRetainingController() {
+  cancelGrayscalePass();
+  syncPendingAsync();
+  if (!_driver || !_driver->supportsRetainedState()) return false;
+  _driver->powerOffRetainingState(_bus);
+  return true;
+}
+
+bool FreeInkDisplay::supportsRetainedController() const {
+  return _driver && _driver->supportsRetainedState();
 }
 
 // ============================================================================

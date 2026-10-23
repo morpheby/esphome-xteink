@@ -42,6 +42,21 @@ constexpr uint8_t CMD_CCSET = 0xE0;               // CCSET (cascade/output enabl
 constexpr uint8_t CMD_GATE_SCAN = 0xE1;           // gate-scan selection
 constexpr uint8_t CMD_TSSET = 0xE5;               // TSSET (forced temperature)
 
+// Shutdown must never strand the host after ESPHome has already torn down its
+// API and OTA services. POF normally returns BUSY_N high quickly, but a panel
+// whose pin remains asserted must not turn a controller wait into an infinite
+// MCU-awake state. Two seconds is far longer than the configured PFS sequence;
+// after it, proceed with shutdown. A non-retained wake resets and fully redraws
+// the controller, while a retained wake has a full minute before its next PON.
+constexpr unsigned long POWER_OFF_BUSY_TIMEOUT_MS = 2000;
+
+void waitPowerOffBounded(EpdBus& bus) {
+  delay(1);  // allow the low-active BUSY_N assertion to become visible
+  const unsigned long started = millis();
+  while (bus.isBusy() && millis() - started < POWER_OFF_BUSY_TIMEOUT_MS)
+    delay(1);
+}
+
 constexpr uint8_t GRAY_LUT_LEN = 49;
 struct GrayLut {
   uint8_t cmd;
@@ -282,17 +297,25 @@ void Uc8279X4Driver::initController(EpdBus& bus) {
   _grayRefreshedOnce = false;
 }
 
-void Uc8279X4Driver::begin(EpdBus& bus) {
+void Uc8279X4Driver::resetRuntimeState(bool retained) {
   _directGrayOnPanel = false;
   _grayImagePass = false;
   _absoluteInput = false;
   _directGrayPass = false;
-  _oldPlaneValid = false;
-  _needFullClear = true;
+  _oldPlaneValid = retained;
+  _needFullClear = !retained;
   _redriveAfterGray = false;
   _grayscaleWindowEnabled = false;
-  bus.reset(50);
-  initController(bus);
+  _pendingRefresh = false;
+  _pendingTurnOff = false;
+  _pendingPartial = false;
+  _isScreenOn = false;
+  _grayRefreshedOnce = retained;
+  _grayBaseValid = false;
+  _absoluteGrayPlanes = false;
+}
+
+void Uc8279X4Driver::ensureGrayScratch() {
   // Framebuffer-sized scratch for the grayscale absolute-plane fold (SPIRAM;
   // falls back to a plain malloc). If it can't be had, copyGrayscale* degrade to
   // the raw-plane fallback path.
@@ -300,8 +323,22 @@ void Uc8279X4Driver::begin(EpdBus& bus) {
     _grayBase = static_cast<uint8_t*>(heap_caps_malloc(_bufferSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (_grayBase == nullptr) _grayBase = static_cast<uint8_t*>(malloc(_bufferSize));
   }
-  _grayBaseValid = false;
-  _absoluteGrayPlanes = false;
+}
+
+void Uc8279X4Driver::begin(EpdBus& bus) {
+  resetRuntimeState(false);
+  bus.reset(50);
+  initController(bus);
+  ensureGrayScratch();
+}
+
+void Uc8279X4Driver::beginRetained(EpdBus& bus) {
+  (void)bus;
+  // The host MCU restarted, but the controller never received DSLP or RESET.
+  // Preserve both image planes and every programmed register. Only rebuild the
+  // C++ object's volatile bookkeeping and scratch allocation.
+  resetRuntimeState(true);
+  ensureGrayScratch();
 }
 
 void Uc8279X4Driver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff) {
@@ -529,6 +566,17 @@ void Uc8279X4Driver::displayFinish(EpdBus& bus, const uint8_t* fb) {
   }
 }
 
+void Uc8279X4Driver::seedPreviousFrame(EpdBus& bus, const uint8_t* buf) {
+  if (!buf) return;
+  // Re-establish only the differential OLD reference for callers explicitly
+  // switching to a controller-RAM baseline. The retained deep-sleep lifecycle
+  // never calls this: its exact OLD/NEW planes remain live across MCU sleep.
+  // No display-refresh command is issued, so the visible panel is untouched.
+  streamPlane(bus, CMD_DTM1, buf);
+  _oldPlaneValid = true;
+  _needFullClear = false;
+}
+
 void Uc8279X4Driver::requestResync(uint8_t settlePasses) {
   _grayImagePass = false;
   _absoluteInput = false;
@@ -538,7 +586,21 @@ void Uc8279X4Driver::requestResync(uint8_t settlePasses) {
   _needFullClear = true;
 }
 
-void Uc8279X4Driver::skipInitialResync() { _needFullClear = false; }
+void Uc8279X4Driver::skipInitialResync() {
+  // The caller has reconstructed the exact retained frame in its host buffers.
+  // Adopt the controller state logically only; do not stream either plane or
+  // trigger a waveform, because doing so destroys the retained gray reference.
+  _needFullClear = false;
+  _oldPlaneValid = true;
+  _grayRefreshedOnce = true;
+  _redriveAfterGray = false;
+  _grayBaseValid = false;
+  _absoluteGrayPlanes = false;
+  _absoluteInput = false;
+  _directGrayPass = false;
+  _directGrayOnPanel = false;
+  _grayscaleWindowEnabled = false;
+}
 
 void Uc8279X4Driver::deepSleep(EpdBus& bus) {
   _directGrayOnPanel = false;
@@ -548,11 +610,22 @@ void Uc8279X4Driver::deepSleep(EpdBus& bus) {
   _grayscaleWindowEnabled = false;
   if (_isScreenOn) {
     bus.cmd(CMD_POWER_OFF);
-    bus.waitBusy(" 8279x4 power-down");
+    waitPowerOffBounded(bus);
     _isScreenOn = false;
   }
   bus.cmd(CMD_DEEP_SLEEP);
   bus.data(0xA5);
+}
+
+void Uc8279X4Driver::powerOffRetainingState(EpdBus& bus) {
+  // POF disables the charge pumps but leaves controller RAM/register state
+  // available for the next PON. Do not send DSLP: leaving it requires RESET,
+  // which would destroy the differential and native-gray reference planes.
+  if (_isScreenOn) {
+    bus.cmd(CMD_POWER_OFF);
+    waitPowerOffBounded(bus);
+    _isScreenOn = false;
+  }
 }
 
 // --- 4-level grayscale (anti-aliasing) --------------------------------------
