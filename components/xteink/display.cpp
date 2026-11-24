@@ -1,649 +1,377 @@
 #include "display.h"
 
-#include "esphome/core/log.h"
-
-#include <algorithm>
-#include <cstdlib>
+#include <cstdio>
 #include <cstring>
-#include <esp_heap_caps.h>
+#include <esp_attr.h>
+#include <XteinkDetect.h>
 
+#include "esphome/core/application.h"
+#include "esphome/core/log.h"
 namespace esphome {
 namespace xteink {
-
-static const char *const TAG = "xteink.display";
-
+RTC_DATA_ATTR static PanelSleepState sleep_panel{};
+PanelSleepState& panel_sleep_state() { return sleep_panel; }
+static const char* const TAG = "xteink.display";
+static constexpr uint32_t TouchSettleDelayMs = 160;
 void XteinkDisplay::setup() {
-  // update_when_display_idle uses this component's loop state as the display
-  // busy signal. Stay idle until an asynchronous panel waveform is running;
-  // loop() is enabled only for that window and disables itself on completion.
-  this->disable_loop();
-
-  if (!this->grayscale_enabled_)
-    return;
-
-  auto &epd = this->parent_->display();
-  if (this->uses_native_grayscale_planes_()) {
-    const auto mode = this->grayscale_strategy_ == GRAYSCALE_ADAPTIVE ? freeink::GrayscaleMode::Overlay
-                                                                      : freeink::GrayscaleMode::Absolute;
-    const auto capabilities = epd.grayscaleCapabilities(mode);
-    if (!capabilities.supported()) {
-      ESP_LOGW(TAG, "The detected panel does not support the requested four-level grayscale mode; using monochrome");
-      this->grayscale_warning_logged_ = true;
-      return;
-    }
-  }
-
-  this->gray_buffer_size_ = static_cast<size_t>(epd.getDisplayWidthBytes()) * epd.getDisplayHeight();
-  this->gray_luma_size_ = static_cast<size_t>(epd.getDisplayWidth()) * epd.getDisplayHeight();
-#if defined(BOARD_HAS_PSRAM)
-  this->gray_luma_ =
-      static_cast<uint8_t *>(heap_caps_malloc(this->gray_luma_size_, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-  if (this->uses_native_grayscale_planes_()) {
-    this->gray_lsb_ =
-        static_cast<uint8_t *>(heap_caps_malloc(this->gray_buffer_size_, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    this->gray_msb_ =
-        static_cast<uint8_t *>(heap_caps_malloc(this->gray_buffer_size_, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-  }
-#endif
-  if (this->gray_luma_ == nullptr)
-    this->gray_luma_ = static_cast<uint8_t *>(malloc(this->gray_luma_size_));
-  if (this->uses_native_grayscale_planes_()) {
-    if (this->gray_lsb_ == nullptr)
-      this->gray_lsb_ = static_cast<uint8_t *>(malloc(this->gray_buffer_size_));
-    if (this->gray_msb_ == nullptr)
-      this->gray_msb_ = static_cast<uint8_t *>(malloc(this->gray_buffer_size_));
-  }
-  const bool allocation_failed = this->gray_luma_ == nullptr ||
-                                 (this->uses_native_grayscale_planes_() &&
-                                  (this->gray_lsb_ == nullptr || this->gray_msb_ == nullptr));
-  if (allocation_failed) {
-    free(this->gray_luma_);
-    free(this->gray_lsb_);
-    free(this->gray_msb_);
-    this->gray_luma_ = nullptr;
-    this->gray_lsb_ = nullptr;
-    this->gray_msb_ = nullptr;
-    const size_t requested = this->gray_luma_size_ +
-                             (this->uses_native_grayscale_planes_() ? this->gray_buffer_size_ * 2 : 0);
-    ESP_LOGW(TAG, "Could not allocate %u bytes for grayscale; using monochrome", static_cast<unsigned>(requested));
-    this->grayscale_warning_logged_ = true;
-    return;
-  }
-  memset(this->gray_luma_, 0xFF, this->gray_luma_size_);
-  if (this->uses_native_grayscale_planes_()) {
-    memset(this->gray_lsb_, 0xFF, this->gray_buffer_size_);
-    memset(this->gray_msb_, 0xFF, this->gray_buffer_size_);
-  }
-  this->grayscale_available_ = true;
-  const size_t allocated = this->gray_luma_size_ +
-                           (this->uses_native_grayscale_planes_() ? this->gray_buffer_size_ * 2 : 0);
-  ESP_LOGI(TAG, "Grayscale enabled using %s rendering (%u bytes)",
-           this->grayscale_strategy_ == GRAYSCALE_NATIVE ? "native" :
-           this->grayscale_strategy_ == GRAYSCALE_ADAPTIVE ? "adaptive" : "ordered-dither",
-           static_cast<unsigned>(allocated));
-}
-
-void XteinkDisplay::draw_absolute_pixel_internal(int x, int y, Color color) {
-  auto &epd = this->parent_->display();
-  if (x < 0 || y < 0 || x >= epd.getDisplayWidth() || y >= epd.getDisplayHeight())
-    return;
-  uint8_t *buf = epd.getFrameBuffer();
-  const uint32_t idx = y * epd.getDisplayWidthBytes() + (x >> 3);
-  const uint8_t bit = 0x80 >> (x & 7);
-
-  // ESPHome's native binary drawing API uses COLOR_ON for marked (black) pixels,
-  // while draw_pixels_at() receives literal RGB from LVGL where black is 0 and
-  // white is 255. Keep both contracts instead of applying Color::is_on() to RGB.
-  const uint16_t luma = (77U * color.r + 150U * color.g + 29U * color.b + 128U) >> 8;
-  const bool black = this->rgb_input_ ? luma < 128 : color.is_on();
-  const uint8_t old = buf[idx];
-  if (black) {
-    buf[idx] &= static_cast<uint8_t>(~bit);  // 0 = black
-  } else {
-    buf[idx] |= bit;  // 1 = white
-  }
-  this->buffer_dirty_ |= old != buf[idx];
-
-  if (this->grayscale_available_) {
-    // Preserve 8-bit luminance until refresh. Quantizing here would destroy the
-    // coverage produced by anti-aliased fonts and would make a later ordered or
-    // error-diffusion dither impossible to implement correctly.
-    const size_t luma_idx = static_cast<size_t>(y) * epd.getDisplayWidth() + x;
-    // Native display drawing uses COLOR_ON (255) as ink and COLOR_OFF (0) as
-    // paper, the inverse of literal RGB luminance. Preserve intermediate native
-    // values as coverage so multi-bpp ESPHome fonts remain anti-aliased too.
-    const uint8_t output_luma =
-        this->rgb_input_ ? static_cast<uint8_t>(luma) : static_cast<uint8_t>(255U - luma);
-    if (this->gray_luma_[luma_idx] != output_luma) {
-      this->buffer_dirty_ = true;
-      if (this->grayscale_strategy_ == GRAYSCALE_ADAPTIVE)
-        this->mark_grayscale_dirty_(x, y);
-    }
-    this->gray_luma_[luma_idx] = output_luma;
-  }
-}
-
-void XteinkDisplay::mark_grayscale_dirty_(int x, int y) {
-  if (this->grayscale_dirty_full_)
-    return;
-  if (!this->grayscale_dirty_valid_) {
-    this->grayscale_dirty_x0_ = this->grayscale_dirty_x1_ = x;
-    this->grayscale_dirty_y0_ = this->grayscale_dirty_y1_ = y;
-    this->grayscale_dirty_valid_ = true;
-    return;
-  }
-  if (x < this->grayscale_dirty_x0_)
-    this->grayscale_dirty_x0_ = x;
-  if (x > this->grayscale_dirty_x1_)
-    this->grayscale_dirty_x1_ = x;
-  if (y < this->grayscale_dirty_y0_)
-    this->grayscale_dirty_y0_ = y;
-  if (y > this->grayscale_dirty_y1_)
-    this->grayscale_dirty_y1_ = y;
-}
-
-void XteinkDisplay::mark_grayscale_full_() {
-  this->grayscale_dirty_valid_ = true;
-  this->grayscale_dirty_full_ = true;
-}
-
-void XteinkDisplay::clear_grayscale_dirty_() {
-  this->grayscale_dirty_valid_ = false;
-  this->grayscale_dirty_full_ = false;
-}
-
-bool XteinkDisplay::is_grayscale_neighbor_(int x, int y) const {
-  auto &epd = this->parent_->display();
-  const int width = epd.getDisplayWidth();
-  const size_t luma_idx = static_cast<size_t>(y) * width + x;
-  const uint8_t level = static_cast<uint8_t>((this->gray_luma_[luma_idx] * 3U + 127U) / 255U);
-  if (level == 1 || level == 2)
-    return true;
-
-  // The changed pixel may have erased part of a gray object. The native-gray
-  // planes still describe the last settled frame until render_grayscale_overlay_()
-  // runs, so include intermediate pixels from either the old or new frame.
-  const size_t plane_idx = static_cast<size_t>(y) * epd.getDisplayWidthBytes() + (x >> 3);
-  const uint8_t bit = static_cast<uint8_t>(0x80 >> (x & 7));
-  return ((this->gray_lsb_[plane_idx] | this->gray_msb_[plane_idx]) & bit) != 0;
-}
-
-void XteinkDisplay::expand_grayscale_dirty_to_neighbors_() {
-  if (!this->grayscale_dirty_valid_ || this->grayscale_dirty_full_)
-    return;
-
-  auto &epd = this->parent_->display();
-  const int max_x = epd.getDisplayWidth() - 1;
-  const int max_y = epd.getDisplayHeight() - 1;
-  int x0 = this->grayscale_dirty_x0_;
-  int y0 = this->grayscale_dirty_y0_;
-  int x1 = this->grayscale_dirty_x1_;
-  int y1 = this->grayscale_dirty_y1_;
-
-  // Grow the rectangle one row/column at a time while its perimeter touches
-  // intermediate-gray pixels. This follows connected antialiasing, arcs, and
-  // fills to their object boundary without forcing an unrelated full-screen
-  // settle. Including the one-pixel corners makes diagonal AA connectivity
-  // count as neighboring too.
-  bool expanded;
-  do {
-    expanded = false;
-    if (x0 > 0) {
-      for (int y = std::max(0, y0 - 1); y <= std::min(max_y, y1 + 1); y++) {
-        if (this->is_grayscale_neighbor_(x0 - 1, y)) {
-          x0--;
-          expanded = true;
-          break;
-        }
-      }
-    }
-    if (x1 < max_x) {
-      for (int y = std::max(0, y0 - 1); y <= std::min(max_y, y1 + 1); y++) {
-        if (this->is_grayscale_neighbor_(x1 + 1, y)) {
-          x1++;
-          expanded = true;
-          break;
-        }
-      }
-    }
-    if (y0 > 0) {
-      for (int x = std::max(0, x0 - 1); x <= std::min(max_x, x1 + 1); x++) {
-        if (this->is_grayscale_neighbor_(x, y0 - 1)) {
-          y0--;
-          expanded = true;
-          break;
-        }
-      }
-    }
-    if (y1 < max_y) {
-      for (int x = std::max(0, x0 - 1); x <= std::min(max_x, x1 + 1); x++) {
-        if (this->is_grayscale_neighbor_(x, y1 + 1)) {
-          y1++;
-          expanded = true;
-          break;
-        }
-      }
-    }
-  } while (expanded);
-
-  this->grayscale_dirty_x0_ = x0;
-  this->grayscale_dirty_y0_ = y0;
-  this->grayscale_dirty_x1_ = x1;
-  this->grayscale_dirty_y1_ = y1;
-}
-
-void XteinkDisplay::render_grayscale_planes_() {
-  auto &epd = this->parent_->display();
-  memset(this->gray_lsb_, 0, this->gray_buffer_size_);
-  memset(this->gray_msb_, 0, this->gray_buffer_size_);
-  for (int y = 0; y < epd.getDisplayHeight(); y++) {
-    for (int x = 0; x < epd.getDisplayWidth(); x++) {
-      const size_t luma_idx = static_cast<size_t>(y) * epd.getDisplayWidth() + x;
-      const size_t plane_idx = static_cast<size_t>(y) * epd.getDisplayWidthBytes() + (x >> 3);
-      const uint8_t bit = 0x80 >> (x & 7);
-      // Current output is the panel's native four levels. Keeping quantization
-      // in this one full-frame stage lets a future dither select among those
-      // levels using the original 8-bit luminance and neighboring pixels.
-      const uint8_t level = static_cast<uint8_t>((this->gray_luma_[luma_idx] * 3U + 127U) / 255U);
-      if (level & 1)
-        this->gray_lsb_[plane_idx] |= bit;
-      if (level & 2)
-        this->gray_msb_[plane_idx] |= bit;
-    }
-  }
-}
-
-void XteinkDisplay::render_grayscale_overlay_() {
-  // CrossPoint uses overlay masks for anti-aliased text and UI: first paint a
-  // B/W base where every non-white pixel is black, then the AA waveform nudges
-  // only the two intermediate levels toward dark/light gray. Unlike Absolute,
-  // this does not classify the whole dashboard as a grayscale image or select
-  // the full-panel quality waveform.
-  auto &epd = this->parent_->display();
-  uint8_t *base = epd.getFrameBuffer();
-  memset(base, 0, this->gray_buffer_size_);
-  memset(this->gray_lsb_, 0, this->gray_buffer_size_);
-  memset(this->gray_msb_, 0, this->gray_buffer_size_);
-  const int width = epd.getDisplayWidth();
-  const int width_bytes = epd.getDisplayWidthBytes();
-
-  for (int y = 0; y < epd.getDisplayHeight(); y++) {
-    for (int x = 0; x < width; x++) {
-      const size_t luma_idx = static_cast<size_t>(y) * width + x;
-      const size_t plane_idx = static_cast<size_t>(y) * width_bytes + (x >> 3);
-      const uint8_t bit = static_cast<uint8_t>(0x80 >> (x & 7));
-      const uint8_t level = static_cast<uint8_t>((this->gray_luma_[luma_idx] * 3U + 127U) / 255U);
-      if (level == 3) {
-        base[plane_idx] |= bit;  // white remains white in the B/W base
-      } else if (level == 1) {
-        this->gray_lsb_[plane_idx] |= bit;  // dark gray = (LSB, MSB) (1, 1)
-        this->gray_msb_[plane_idx] |= bit;
-      } else if (level == 2) {
-        this->gray_msb_[plane_idx] |= bit;  // light gray = (0, 1)
-      }
-    }
-  }
-}
-
-bool XteinkDisplay::render_ordered_dither_() {
-  // A fixed, screen-space Bayer matrix turns continuous luminance into a stable
-  // binary texture. The ordinary differential waveform then only drives pixels
-  // whose dithered state changed, unlike the controller's 50-frame native-gray
-  // waveform which activates the entire panel for every update.
-  static constexpr uint8_t BAYER_4X4[16] = {
-      0, 8, 2, 10,
-      12, 4, 14, 6,
-      3, 11, 1, 9,
-      15, 7, 13, 5,
-  };
-
-  auto &epd = this->parent_->display();
-  uint8_t *buf = epd.getFrameBuffer();
-  const uint8_t *displayed = epd.getActiveFrameBuffer();
-  const int width = epd.getDisplayWidth();
-  const int width_bytes = epd.getDisplayWidthBytes();
-  bool changed = false;
-
-  int x0 = 0;
-  int y0 = 0;
-  int x1 = width - 1;
-  int y1 = epd.getDisplayHeight() - 1;
-  const bool zoned = this->grayscale_has_settled_ && this->grayscale_dirty_valid_ &&
-                     !this->grayscale_dirty_full_;
-  if (zoned) {
-    x0 = this->grayscale_dirty_x0_;
-    y0 = this->grayscale_dirty_y0_;
-    x1 = this->grayscale_dirty_x1_;
-    y1 = this->grayscale_dirty_y1_;
-  }
-
-  for (int y = y0; y <= y1; y++) {
-    for (int byte_x = x0 >> 3; byte_x <= (x1 >> 3); byte_x++) {
-      const size_t idx = static_cast<size_t>(y) * width_bytes + byte_x;
-      // A zoned preview starts from the settled B/W base and replaces only the
-      // changed pixels. Bits sharing either edge byte stay untouched.
-      uint8_t output = zoned ? buf[idx] : 0;
-      for (int bit_x = 0; bit_x < 8; bit_x++) {
-        const int x = byte_x * 8 + bit_x;
-        if (x >= width)
-          break;
-        if (zoned && (x < x0 || x > x1))
-          continue;
-        const uint8_t bit = static_cast<uint8_t>(0x80 >> bit_x);
-        const uint8_t luma = this->gray_luma_[static_cast<size_t>(y) * width + x];
-        const uint8_t threshold = static_cast<uint8_t>(BAYER_4X4[(y & 3) * 4 + (x & 3)] * 16 + 8);
-        if (luma > threshold)
-          output |= bit;  // 1 = paper/white
-        else
-          output &= static_cast<uint8_t>(~bit);
-      }
-      // LVGL first paints RGB into the binary write buffer, which temporarily
-      // replaces dither pixels with a simple 50% threshold. Comparing against
-      // that transient buffer falsely reports unchanged gray regions as dirty.
-      // The active buffer is the last frame actually submitted to the panel.
-      changed |= displayed != nullptr ? displayed[idx] != output : buf[idx] != output;
-      buf[idx] = output;
-    }
-  }
-  return changed;
-}
-
-void XteinkDisplay::schedule_grayscale_settle_() {
-  if (this->grayscale_strategy_ != GRAYSCALE_ADAPTIVE || !this->grayscale_available_)
-    return;
-  this->grayscale_settle_pending_ = true;
-  this->set_timeout("grayscale_settle", this->grayscale_settle_time_, [this]() { this->settle_grayscale(); });
-}
-
-void XteinkDisplay::postpone_grayscale_settle() {
-  if (this->grayscale_strategy_ == GRAYSCALE_ADAPTIVE && this->grayscale_available_) {
-    // activity() runs immediately before LVGL dispatches the button/page event.
-    // Mark that next draw as latency-sensitive so it receives an immediate
-    // dither preview; expire the marker if the touch changed no widget.
-    this->interactive_preview_requested_ = true;
-    this->set_timeout("grayscale_interactive_preview", 1000, [this]() {
-      this->interactive_preview_requested_ = false;
-    });
-  }
-  if (!this->grayscale_settle_pending_)
-    return;
-  this->set_timeout("grayscale_settle", this->grayscale_settle_time_, [this]() { this->settle_grayscale(); });
-}
-
-void XteinkDisplay::prepare_page_change() {
-  if (this->grayscale_strategy_ != GRAYSCALE_ADAPTIVE || !this->grayscale_available_)
-    return;
-
-  this->mark_grayscale_full_();
-  if (!this->grayscale_has_settled_)
-    return;
-
-  // A native-gray page leaves analog gray charge that a normal DU page change
-  // does not fully erase. Promote the next actual framebuffer update to the
-  // panel's strong full waveform, but only when leaving a settled-gray state.
-  this->force_full_refresh_ = true;
-  this->interactive_preview_requested_ = true;
-}
-
-bool XteinkDisplay::settle_grayscale() {
-  // Timer-wake shutdown can request the final native-gray frame immediately
-  // after LVGL submits its dithered preview. Drain that pending waveform first
-  // so the settled frame is guaranteed to reach the panel before deep sleep.
-  this->finish_pending_refresh_(true);
-  this->cancel_timeout("grayscale_settle");
-  this->grayscale_settle_pending_ = false;
-  if (this->grayscale_strategy_ != GRAYSCALE_ADAPTIVE || !this->grayscale_available_ || !this->has_drawn_)
-    return false;
-  if (!this->grayscale_dirty_valid_)
-    return false;
-
-  auto &epd = this->parent_->display();
-  const bool zoned = this->grayscale_has_settled_ && !this->grayscale_dirty_full_;
-  if (zoned) {
-    this->expand_grayscale_dirty_to_neighbors_();
-    constexpr int MARGIN = 4;
-    const int x0 = std::max(0, this->grayscale_dirty_x0_ - MARGIN);
-    const int y0 = std::max(0, this->grayscale_dirty_y0_ - MARGIN);
-    const int x1 = std::min(epd.getDisplayWidth() - 1, this->grayscale_dirty_x1_ + MARGIN);
-    const int y1 = std::min(epd.getDisplayHeight() - 1, this->grayscale_dirty_y1_ + MARGIN);
-    epd.setGrayscaleWindow(x0, y0, x1 - x0 + 1, y1 - y0 + 1);
-  } else {
-    epd.setGrayscaleWindow(0, 0, 0, 0);
-  }
-  // Adaptive UI settling follows CrossPoint's text/UI path. Its overlay mode
-  // drives only intermediate-gray pixels after a differential B/W base. Keep
-  // the explicit native strategy on Absolute for full grayscale images.
-  this->render_grayscale_overlay_();
-  // Fast lets the controller move from the dither preview to the overlay's
-  // solid B/W base with its differential preconditioning waveform; the gray
-  // pass then drives only the intermediate-level masks.
-  if (!epd.displayGrayscaleBase(freeink::GrayscaleMode::Overlay, EInkDisplay::FAST_REFRESH)) {
-    ESP_LOGW(TAG, "Native grayscale settle became unavailable; keeping ordered-dither output");
-    epd.setGrayscaleWindow(0, 0, 0, 0);
-    return false;
-  }
-  epd.copyGrayscaleBuffers(this->gray_lsb_, this->gray_msb_);
-  epd.displayGrayBuffer();
-  epd.cleanupGrayscaleBuffers(epd.getFrameBuffer());
-  // Adaptive UI updates should retain unchanged native-gray pixels. Without
-  // this opt-in the UC8279 reader policy re-drives the whole panel back to its
-  // dither pattern as soon as one telemetry digit changes.
-  epd.preserveGrayscaleOnFastRefresh();
-#ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
-  // A background value update may have prepared a newer binary base without
-  // displaying that dither preview. Make that write buffer the active baseline
-  // now that its matching native-gray frame is physically on the panel.
-  epd.swapBuffers();
-#endif
-  epd.syncWriteBufferFromActive();
-  this->native_grayscale_on_panel_ = true;
-  this->grayscale_has_settled_ = true;
-  this->clear_grayscale_dirty_();
-  this->update_count++;
-  this->partial_refresh_count_ = 0;
-  return true;
-}
-
-bool XteinkDisplay::flush_for_deep_sleep() {
-  // LVGL can finish drawing into the host framebuffer shortly before a sleep
-  // script runs. settle_grayscale() only refines a frame which has already
-  // reached the panel, so first submit any dirty B/W preview and synchronously
-  // finish its waveform. This makes the sleep boundary a real display flush.
-  this->finish_pending_refresh_(true);
-  if (this->buffer_dirty_) {
-    this->update();
-    this->finish_pending_refresh_(true);
-  }
-
-  if (this->grayscale_strategy_ == GRAYSCALE_ADAPTIVE && this->grayscale_available_ &&
-      this->grayscale_dirty_valid_)
-    return this->settle_grayscale();
-  return this->has_drawn_;
-}
-
-void XteinkDisplay::finalize_refresh_(EInkDisplay::RefreshMode mode) {
-  auto &epd = this->parent_->display();
-  // In dual-buffer mode displayBufferAsync() swaps current and previous
-  // frames. LVGL patches only dirty regions, so seed its new write surface
-  // from the completed displayed frame.
-  epd.syncWriteBufferFromActive();
-  this->has_drawn_ = true;
-  this->update_count++;
-  if (mode == EInkDisplay::FAST_REFRESH)
-    this->partial_refresh_count_++;
+  disable_loop();
+  if (get_width_internal() == 800 && get_height_internal() == 480)
+    ready_ = frames_.allocate();
   else
-    this->partial_refresh_count_ = 0;
-  this->buffer_dirty_ = false;
-  if (this->grayscale_strategy_ == GRAYSCALE_ADAPTIVE)
-    this->native_grayscale_on_panel_ = false;
-  this->schedule_grayscale_settle_();
+    ready_ = false;
+  if (!ready_ && grayscale_) {
+    mark_failed();
+    ESP_LOGE(TAG, "Rendering storage unavailable");
+  }
 }
-
-bool XteinkDisplay::finish_pending_refresh_(bool wait) {
-  if (!this->refresh_pending_)
-    return true;
-
-  auto &epd = this->parent_->display();
-  if (!wait && epd.refreshBusy())
+bool XteinkDisplay::set_rendering_mode(int mode) {
+  if (mode < 0 || mode > 3) return false;
+  if (mode && BoardConfig::ACTIVE.displayController != BoardConfig::DisplayController::UC8279)
     return false;
-
-  epd.waitRefreshComplete();
-  const auto mode = this->pending_refresh_mode_;
-  this->refresh_pending_ = false;
-  this->finalize_refresh_(mode);
-  this->disable_loop();
+  if (requested_mode_ == mode) return true;
+  reset_touch_preview_();
+  requested_mode_ = mode;
+  force_full_ = true;
+  dirty_ = true;
   return true;
 }
-
-void XteinkDisplay::loop() { this->finish_pending_refresh_(false); }
-
-void XteinkDisplay::draw_pixels_at(int x_start, int y_start, int w, int h, const uint8_t *ptr,
-                                   display::ColorOrder order, display::ColorBitness bitness, bool big_endian,
-                                   int x_offset, int y_offset, int x_pad) {
-  this->rgb_input_ = true;
-  display::Display::draw_pixels_at(x_start, y_start, w, h, ptr, order, bitness, big_endian, x_offset, y_offset, x_pad);
-  this->rgb_input_ = false;
+bool XteinkDisplay::load_panel_calibration(const ::x4render::PanelCalibration& calibration) {
+  if (pending_ || frozen_ || tuned_state_ == TunedState::Held ||
+      !masked_refresh_.loadCalibration(calibration)) return false;
+  reset_touch_preview_();
+  force_full_ = true;
+  dirty_ |= has_frame_;
+  return true;
 }
-
-void XteinkDisplay::update() {
-  // LVGL's update_when_display_idle gate should prevent this, but keep the
-  // framebuffer ownership invariant explicit if another caller invokes update.
-  if (this->refresh_pending_)
+void XteinkDisplay::reset_touch_preview_() {
+  touch_phase_ = TouchPhase::Idle;
+  cancel_timeout("touch_settle");
+}
+void XteinkDisplay::prepare_page_change() {
+  reset_touch_preview_();
+  force_full_ = true;
+}
+bool XteinkDisplay::select_region(uint16_t x, uint16_t y, uint16_t width, uint16_t height, bool bw_only) {
+  if (!ready_ || BoardConfig::ACTIVE.displayController != BoardConfig::DisplayController::UC8279 ||
+      frozen_ || pending_ ||
+      tuned_state_ == TunedState::Held || !width || !height ||
+      x + width > ::x4render::Width || y + height > ::x4render::Height) return false;
+  reset_touch_preview_();
+  selected_region_ = {x, y, width, height};
+  region_bw_only_ = bw_only;
+  region_state_ = RegionState::Selected;
+  dirty_ = true;
+  return true;
+}
+void XteinkDisplay::clear_region() {
+  selected_region_ = {};
+  region_bw_only_ = false;
+  region_state_ = RegionState::Normal;
+  force_full_ = true;
+}
+bool XteinkDisplay::region_update_finished() const {
+  return region_state_ == RegionState::Complete || region_state_ == RegionState::Failed;
+}
+bool XteinkDisplay::region_update_succeeded() const {
+  return region_state_ == RegionState::Complete;
+}
+void XteinkDisplay::begin_touch_preview() {
+  if (!ready_ || frozen_) return;
+  cancel_timeout("touch_settle");
+  touch_phase_ = TouchPhase::Dragging;
+}
+void XteinkDisplay::end_touch_preview() {
+  if (touch_phase_ != TouchPhase::Dragging) return;
+  touch_phase_ = TouchPhase::Released;
+  schedule_touch_settle_();
+}
+void XteinkDisplay::schedule_touch_settle_() {
+  if (touch_phase_ != TouchPhase::Released || pending_) return;
+  // Let LVGL flush the final slider position after the previous drive releases
+  // the display. A second press cancels this settle without losing its mask.
+  set_timeout("touch_settle", TouchSettleDelayMs, [this]() {
+    touch_phase_ = TouchPhase::Idle;
+    dirty_ |= frames_.hasPreview();
+    redraw_requested_ = true;
+    enable_loop();
+  });
+}
+void XteinkDisplay::draw_absolute_pixel_internal(int x, int y, Color color) {
+  if (frozen_ || pending_ || tuned_state_ == TunedState::Held || x < 0 || y < 0 ||
+      x >= get_width_internal() || y >= get_height_internal())
     return;
-
-  auto &epd = this->parent_->display();
-  if (this->writer_local_.has_value()) {
-    // Lambda/pages rendering is a complete-frame API by default. Clear before
-    // drawing, never after displaying: LVGL has no writer and patches only its
-    // invalidated regions into the persistent framebuffer.
-    if (this->auto_clear_enabled_) {
-      epd.clearScreen(0xFF);
-      if (this->grayscale_available_) {
-        memset(this->gray_luma_, 0xFF, this->gray_luma_size_);
-        if (this->grayscale_strategy_ == GRAYSCALE_ADAPTIVE)
-          this->mark_grayscale_full_();
-      }
-      this->buffer_dirty_ = true;
-    }
-    (*this->writer_local_)(*this);
-  }
-  if (!this->buffer_dirty_) {
-    ESP_LOGV(TAG, "Skipping panel refresh: framebuffer is unchanged");
-    return;
-  }
-
-  if (this->grayscale_available_ && this->grayscale_strategy_ == GRAYSCALE_ADAPTIVE &&
-      this->native_grayscale_on_panel_ && !this->interactive_preview_requested_) {
-    // A background telemetry update must not turn a settled gray screen back
-    // into full-screen dither. Prepare the newest binary base in RAM, but defer
-    // the physical panel write to the native-gray settle. Keep the first timer
-    // deadline so a steady stream of HA samples cannot postpone the display
-    // indefinitely; the settle always renders the latest accumulated luma.
-    this->render_ordered_dither_();
-    this->buffer_dirty_ = false;
-    if (!this->grayscale_settle_pending_)
-      this->schedule_grayscale_settle_();
-    return;
-  }
-
-  this->interactive_preview_requested_ = false;
-  this->cancel_timeout("grayscale_interactive_preview");
-
-  EInkDisplay::RefreshMode mode = EInkDisplay::FULL_REFRESH;
-  if (this->refresh_mode_ == HALF_REFRESH) {
-    mode = EInkDisplay::HALF_REFRESH;
-  } else if (this->refresh_mode_ == FAST_REFRESH && !this->has_drawn_) {
-    // After MCU sleep neither the retained panel contents nor the controller's
-    // old-image RAM can be assumed to match our newly allocated framebuffer.
-    // Adaptive gray makes that mismatch especially visible as uneven charge,
-    // so establish one strong known base before the first native-gray settle.
-    mode = this->grayscale_strategy_ == GRAYSCALE_ADAPTIVE ? EInkDisplay::FULL_REFRESH
-                                                           : EInkDisplay::HALF_REFRESH;
-  } else if (this->refresh_mode_ == FAST_REFRESH) {
-    mode = EInkDisplay::FAST_REFRESH;
-  }
-
-  const bool periodic_full = this->full_refresh_every_ != 0 &&
-                             this->partial_refresh_count_ + 1 >= this->full_refresh_every_;
-  if (periodic_full || this->force_full_refresh_)
-    mode = EInkDisplay::FULL_REFRESH;
-  this->force_full_refresh_ = false;
-  if (this->grayscale_strategy_ == GRAYSCALE_ADAPTIVE && mode != EInkDisplay::FAST_REFRESH)
-    this->mark_grayscale_full_();
-
-  bool grayscale_rendered = false;
-  bool ordinary_buffer_refresh = false;
-  if (this->grayscale_available_ && this->grayscale_strategy_ != GRAYSCALE_NATIVE) {
-    if (!this->render_ordered_dither_()) {
-      this->buffer_dirty_ = false;
-      // Native gray has four levels while the preview has only two. A luma
-      // change can land on the same Bayer bit yet still require a gray update.
-      if (this->grayscale_strategy_ == GRAYSCALE_ADAPTIVE && this->grayscale_dirty_valid_ &&
-          !this->grayscale_settle_pending_)
-        this->schedule_grayscale_settle_();
-      return;
-    }
-    ordinary_buffer_refresh = true;
-  } else if (this->grayscale_available_) {
-    this->render_grayscale_planes_();
-    if (epd.displayGrayscaleBase(freeink::GrayscaleMode::Absolute, mode)) {
-      epd.copyGrayscaleBuffers(this->gray_lsb_, this->gray_msb_);
-      epd.displayGrayBuffer();
-      epd.cleanupGrayscaleBuffers(epd.getFrameBuffer());
-      grayscale_rendered = true;
-    } else {
-      if (!this->grayscale_warning_logged_) {
-        ESP_LOGW(TAG, "Grayscale became unavailable; using monochrome");
-        this->grayscale_warning_logged_ = true;
-      }
-      epd.displayBuffer(mode);
-    }
+  auto& epd = parent_->display();
+  const uint8_t luma =
+      uint8_t((77U * color.r + 150U * color.g + 29U * color.b + 128U) >> 8);
+  const uint8_t output = rgb_ ? luma : uint8_t(255U - luma);
+  if (ready_) {
+    const size_t i = size_t(y) * 800 + x;
+    dirty_ |= frames_.target[i] != output;
+    frames_.draw(i, output);
   } else {
-    ordinary_buffer_refresh = true;
+    auto* data = epd.getFrameBuffer();
+    const size_t i = size_t(y) * epd.getDisplayWidthBytes() + (x >> 3);
+    const uint8_t mask = 0x80u >> (x & 7), old = data[i];
+    if (rgb_ ? luma < 128 : color.is_on())
+      data[i] &= uint8_t(~mask);
+    else
+      data[i] |= mask;
+    dirty_ |= old != data[i];
   }
-
-  if (ordinary_buffer_refresh) {
-    if (epd.supportsAsyncRefresh()) {
-      // FreeInk copies the frame into controller RAM, starts the waveform and
-      // swaps its dual buffers before returning. Mark the display busy so LVGL
-      // does not mutate the next write surface until loop() finalizes it, while
-      // the main ESPHome loop remains free for touch, buttons and API traffic.
-      this->buffer_dirty_ = false;
-      this->pending_refresh_mode_ = mode;
-      epd.displayBufferAsync(mode);
-      this->refresh_pending_ = true;
-      this->enable_loop();
+}
+void XteinkDisplay::draw_pixels_at(int x, int y, int w, int h, const uint8_t* p,
+                                   display::ColorOrder order,
+                                   display::ColorBitness bitness, bool endian,
+                                   int xo, int yo, int pad) {
+  rgb_ = true;
+  display::Display::draw_pixels_at(x, y, w, h, p, order, bitness, endian, xo,
+                                   yo, pad);
+  rgb_ = false;
+}
+void XteinkDisplay::update() {
+  if (frozen_ || pending_ || tuned_state_ == TunedState::Held) return;
+  auto& epd = parent_->display();
+  if (writer_.has_value()) {
+    if (auto_clear_enabled_) {
+      if (ready_)
+        frames_.target.clear(255);
+      else
+        epd.clearScreen(255);
+      dirty_ = true;
+    }
+    (*writer_)(*this);
+  }
+  if (virtual_ || !dirty_) return;
+  if (region_state_ != RegionState::Normal) {
+    if (region_state_ == RegionState::Selected) {
+      dirty_ = false;
+      region_state_ = begin_masked_refresh_(false, false) ? RegionState::Running : RegionState::Failed;
+    }
+    return;
+  }
+  if (!force_full_ &&
+      (touch_phase_ == TouchPhase::Released ||
+       (touch_phase_ == TouchPhase::Dragging && !gray_mode_()))) return;
+  if (masked_mode_() && ready_) {
+    dirty_ = false;
+    const bool preview = gray_mode_() && touch_phase_ == TouchPhase::Dragging && !force_full_ &&
+                         frames_.knowledge == ::x4render::Knowledge::Known;
+    const bool periodic = !preview && !frames_.hasPreview() && full_every_ && partials_ >= full_every_;
+    const bool force = force_full_ || refresh_mode_ == FULL_REFRESH || periodic;
+    if (begin_masked_refresh_(force, preview)) {
+      if (!preview) {
+        force_full_ = false;
+        if (pending_) partials_ = force ? 0 : partials_ + 1;
+      }
+    } else if (preview || frames_.hasPreview()) {
+      dirty_ = true;
+    }
+    return;
+  }
+  if (ready_) {
+    ::x4render::Settings s;
+    if (!frames_.plan(s, force_full_)) return;
+    if (!frames_.driven && has_frame_ && !force_full_) {
+      std::memcpy(frames_.displayed.data(), frames_.target.data(),
+                  ::x4render::Pixels);
+      dirty_ = false;
       return;
     }
-    epd.displayBuffer(mode);
+    auto* plane = epd.getFrameBuffer();
+    std::memset(plane, 0, ::x4render::PlaneBytes);
+    for (uint16_t y = 0; y < 480; ++y)
+      for (uint16_t x = 0; x < 800; ++x) {
+        const size_t i = size_t(y) * 800 + x;
+        if (::x4render::quantize(frames_.target[i], x, y, s).base)
+          plane[i / 8] |= 0x80u >> (i % 8);
+      }
+    frames_.preparation();
   }
-#ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
-  // Grayscale does not pass through displayBuffer(), so it does not swap the
-  // two FreeInk buffers. Make the rendered frame active explicitly; the copy
-  // below then gives LVGL an identical persistent write surface.
-  if (grayscale_rendered)
-    epd.swapBuffers();
-#else
-  (void) grayscale_rendered;
-#endif
-  this->finalize_refresh_(mode);
+  const bool full = !has_frame_ || force_full_ ||
+                    refresh_mode_ == FULL_REFRESH ||
+                    (full_every_ && ++partials_ >= full_every_);
+  if (full) partials_ = 0;
+  force_full_ = false;
+  dirty_ = false;
+  auto mode = full
+                  ? EInkDisplay::FULL_REFRESH
+                  : (refresh_mode_ == HALF_REFRESH ? EInkDisplay::HALF_REFRESH
+                                                   : EInkDisplay::FAST_REFRESH);
+  if (epd.supportsAsyncRefresh()) {
+    epd.displayBufferAsync(mode);
+    pending_ = true;
+    enable_loop();
+  } else {
+    epd.displayBuffer(mode);
+    pending_ = true;
+    finish_normal_(true);
+  }
 }
+bool XteinkDisplay::finish_normal_(bool wait) {
+  if (tuned_state_ != TunedState::Idle) {
+    while (tuned_state_ != TunedState::Held && !poll_masked_refresh_()) {
+      if (!wait) return false;
+      App.feed_wdt();
+      delay(1);
+    }
+    return tuned_state_ == TunedState::Idle;
+  }
+  if (!pending_) return true;
+  auto& epd = parent_->display();
+  if (!wait && epd.refreshBusy()) return false;
+  epd.waitRefreshComplete();
+  epd.syncWriteBufferFromActive();
+  if (ready_) {
+    frames_.prepared(true);
+    frames_.commit();
+  }
+  pending_ = false;
+  has_frame_ = true;
+  update_count++;
+  disable_loop();
+  return true;
+}
+bool XteinkDisplay::acquire_controller_() {
+  auto* bus = parent_->display().beginControllerSession();
+  if (!bus) return false;
+  if (!transport_) {
+    transport_.emplace(*bus, []() -> uint32_t { return millis(); });
+  }
+  transport_->clearTrace();
+  transport_->reset();
+  return true;
+}
+bool XteinkDisplay::begin_masked_refresh_(bool force, bool preview) {
+  using namespace ::x4render;
+  const bool regional = region_state_ == RegionState::Selected;
+  const bool use_gray = !regional || !region_bw_only_;
+  const bool stable = use_gray && requested_mode_ == 1;
+  const bool relative = use_gray && requested_mode_ == 2;
+  auto settings = masked_refresh_.settings(stable ? Mode::SingleSettle : relative ? Mode::DitherSettle : Mode::BwDither);
+  if (grayscale_update_margin_.has_value() && (stable || relative))
+    settings.margin = *grayscale_update_margin_;
+  const bool planned = regional ? frames_.planRegion(selected_region_, settings)
+      : preview ? frames_.planPreview(settings.margin) : frames_.plan(settings, force);
+  if (!planned) {
+    ESP_LOGW(TAG, "Could not plan %s refresh in render mode %d", regional ? "regional" : "full or differential",
+             requested_mode_);
+    return false;
+  }
+  if (!frames_.driven) return preview || frames_.commit();
 
+  const auto snapshot = freeink::getXteinkPanelMtpSnapshot();
+  const int temp = snapshot.temperatureC != -128 ? snapshot.temperatureC : 30;
+  const auto profile = freeink::observedX4FactoryProfile(
+      snapshot.data, snapshot.size, snapshot.verified,
+      freeink::getXteinkDisplayProbeDiag().ver[2], temp);
+  const auto drive_plan = profile.power.valid
+      ? masked_refresh_.planFactory(profile.rows, regional || windowed_upload_, preview)
+      : GrayRefresh::FactoryPlan::UnsupportedWaveform;
+  if (drive_plan != GrayRefresh::FactoryPlan::Ready) {
+    frames_.phase = Phase::Idle;
+    ESP_LOGW(TAG, "%s", drive_plan == GrayRefresh::FactoryPlan::OverBudget
+        ? "Source budget exceeds three zones" : "Factory table or pulse profile unavailable");
+    return false;
+  }
+  if (!acquire_controller_()) {
+    frames_.phase = Phase::Idle;
+    return false;
+  }
+  transport_->setPanelPower(profile.power, masked_refresh_.calibration().factoryPowerSetup);
+  transport_->setCalibrationTemperature(temp);
+  masked_started_ = millis();
+  if (!masked_refresh_.start(*transport_, masked_started_)) {
+    parent_->display().endControllerSession();
+    frames_.fail();
+    return false;
+  }
+  driving_touch_preview_ = preview;
+  driving_region_ = regional;
+  tuned_state_ = TunedState::Driving;
+  pending_ = true;
+  enable_loop();
+  return true;
+}
+bool XteinkDisplay::poll_masked_refresh_() {
+  using Status = freeink::Uc8279X4Transport::Status;
+  if (tuned_state_ == TunedState::Driving) {
+    if (!masked_refresh_.poll(*transport_, millis())) return false;
+    tuned_completed_ = masked_refresh_.stage == ::x4render::GrayRefresh::Stage::Done;
+    // Power-off is a separate transaction. Keep the useful render result.
+    if (transport_->status() != Status::Off && transport_->powerOff(millis())) {
+      tuned_state_ = TunedState::PoweringOff;
+      return false;
+    }
+  } else if (transport_->poll(millis()) == freeink::Uc8279X4Transport::Result::Pending) {
+    return false;
+  }
+  const bool preview = driving_touch_preview_;
+  const bool regional = driving_region_;
+  masked_duration_ = millis() - masked_started_;
+  masked_bytes_ = transport_->uploadedBytes();
+  driving_touch_preview_ = false;
+  driving_region_ = false;
+  if (transport_->status() != Status::Off) {
+    tuned_state_ = TunedState::Held;
+    frames_.fail();
+    if (regional && region_state_ == RegionState::Running) region_state_ = RegionState::Failed;
+    pending_ = false;
+    has_frame_ = false;
+    disable_loop();
+    ESP_LOGE(TAG, "Masked refresh power-off unconfirmed");
+    return true;
+  }
+  parent_->display().endControllerSession();
+  if (regional || !has_frame_ || !tuned_completed_)
+    ESP_LOGD(TAG, "%s refresh %s, %u bytes in %u ms",
+             regional ? "Regional" : "Frame", tuned_completed_ ? "complete" : "failed",
+             unsigned(masked_bytes_), unsigned(masked_duration_));
+  if (regional) {
+    // A regional update does not establish the appearance of the rest of
+    // the display. The next normal update must build a fresh full frame.
+    frames_.resetController();
+    has_frame_ = false;
+    if (region_state_ == RegionState::Running)
+      region_state_ = tuned_completed_ ? RegionState::Complete : RegionState::Failed;
+    if (tuned_completed_) update_count++;
+  } else if (tuned_completed_ && (preview ? frames_.commitPreview() : frames_.commit())) {
+    has_frame_ = true;
+    update_count++;
+  } else {
+    frames_.fail();
+    has_frame_ = false;
+  }
+  pending_ = false;
+  tuned_state_ = TunedState::Idle;
+  disable_loop();
+  return true;
+}
+void XteinkDisplay::loop() {
+  if (!finish_normal_(false)) return;
+  schedule_touch_settle_();
+  if (redraw_requested_) {
+    redraw_requested_ = false;
+    update();
+  }
+  if (!pending_) disable_loop();
+}
+bool XteinkDisplay::freeze_for_deep_sleep() {
+  if (!finish_normal_(true)) return false;
+  if (frames_.hasPreview()) {
+    reset_touch_preview_();
+    dirty_ = true;
+    update();
+    if (!finish_normal_(true) || frames_.hasPreview()) return false;
+  }
+  reset_touch_preview_();
+  frozen_ = true;
+  return frozen_;
+}
 void XteinkDisplay::dump_config() {
-  LOG_DISPLAY("", "Xteink e-paper", this);
-  ESP_LOGCONFIG(TAG, "  Refresh mode: %s", this->refresh_mode_ == FULL_REFRESH ? "full" :
-                                               this->refresh_mode_ == FAST_REFRESH ? "fast" : "half");
-  ESP_LOGCONFIG(TAG, "  Full refresh every: %u", static_cast<unsigned>(this->full_refresh_every_));
-  ESP_LOGCONFIG(TAG, "  Grayscale requested: %s", YESNO(this->grayscale_enabled_));
-  ESP_LOGCONFIG(TAG, "  Grayscale available: %s", YESNO(this->grayscale_available_));
-  ESP_LOGCONFIG(TAG, "  Grayscale strategy: %s",
-                this->grayscale_strategy_ == GRAYSCALE_NATIVE ? "native" :
-                this->grayscale_strategy_ == GRAYSCALE_ADAPTIVE ? "adaptive" : "ordered-dither");
-  if (this->grayscale_strategy_ == GRAYSCALE_ADAPTIVE)
-    ESP_LOGCONFIG(TAG, "  Native grayscale settle delay: %u ms",
-                  static_cast<unsigned>(this->grayscale_settle_time_));
-  LOG_UPDATE_INTERVAL(this);
+  LOG_DISPLAY("", "Xteink display", this);
+  ESP_LOGCONFIG(
+      TAG,
+      "X4 Pro renderer with B/W and calibrated grayscale profiles");
 }
-
 }  // namespace xteink
 }  // namespace esphome

@@ -5,6 +5,7 @@
 
 #include <XteinkDetect.h>
 #include <driver/gpio.h>
+#include <esp_attr.h>
 #include <esp_sleep.h>
 
 namespace esphome {
@@ -31,6 +32,7 @@ void Xteink::setup() {
   this->display_.setDisplayX3();
 #endif
   this->display_.begin();
+  this->controller_state_retained_ = false;
   this->input_.begin();
 }
 
@@ -60,20 +62,23 @@ static void hold_pin(int8_t pin, int level) {
 }
 
 void Xteink::on_powerdown() {
-  // Park the panel: booster off + DSLP. The SDK now skips the power-off sequence
-  // when the screen is already off (re-issuing it after a full refresh hung on
-  // BUSY and tripped the 5 s task watchdog, rebooting instead of sleeping). Feed
-  // the watchdog through whatever BUSY wait remains so that can never recur.
+  // Park the panel. When explicitly configured, the UC8279 X4 Pro path disables
+  // its charge pumps but keeps controller RAM alive. Otherwise use the normal
+  // controller deep-sleep sequence; the next boot will perform a full refresh.
+  // Feed the watchdog through whatever BUSY wait remains so a slow power-off
+  // cannot trip the 5 s task watchdog instead of sleeping.
   this->display_.setBusyWaitSliceHook([](int8_t, uint8_t) {
     App.feed_wdt();
     delay(1);
     return true;
   });
+  // A forced shutdown can occur while a refresh owns the controller.
+  if (this->display_.controllerSessionActive()) return;
   this->display_.deepSleep();
 
   const auto &b = BoardConfig::ACTIVE;
-  // Panel RESET must not float through sleep: an unpowered-but-floating RESET can
-  // let the controller drift out of DSLP and restart its booster (milliamp drain).
+  // Panel RESET must not float through sleep: a transient reset would discard a
+  // retained controller image; on other panels it can also restart the booster.
   // Mirrors the SDK PowerManager: LOW alongside a switched-off panel rail, HIGH
   // when the rail stays powered (X4/X3). EpdBus::begin() releases the hold on wake.
   hold_pin(b.display.rst, b.display.powerEnable >= 0 ? 0 : 1);
@@ -113,8 +118,13 @@ void Xteink::on_powerdown() {
 }
 
 void Xteink::dump_config() {
-  ESP_LOGCONFIG(TAG, "Xteink:\n  Board: %s\n  Panel: %ux%u", BoardConfig::ACTIVE.name,
-                this->display_.getDisplayWidth(), this->display_.getDisplayHeight());
+  ESP_LOGCONFIG(TAG,
+                "Xteink:\n"
+                "  Board: %s\n"
+                "  Panel: %ux%u\n"
+                "  Retain display controller through MCU sleep: %s",
+                BoardConfig::ACTIVE.name, this->display_.getDisplayWidth(), this->display_.getDisplayHeight(),
+                YESNO(this->retain_display_controller_));
   LOG_UPDATE_INTERVAL(this);
 }
 
